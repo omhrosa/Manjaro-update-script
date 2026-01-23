@@ -625,54 +625,85 @@ echo -e "\n\n"
 
 # Function to execute commands and check for errors
 run_command() {
-  echo -e "\n\n\n"
-  echo -e "${cyan}Running: $*${reset}"
+  # keep the original string BEFORE any shift (otherwise you print '' after shift)
+  local pretty="$*"
+
+  echo -e "\n\n\n${cyan}Running: ${pretty}${reset}"
+
+  # hard fail if called empty
+  if (( $# == 0 )); then
+    echo -e "${red}Error: run_command called with no arguments.${reset}"
+    return 1
+  fi
+
+  local status=0
+  local cmd_str=""
 
   if [[ "$1" == "sudo" && "$2" == "pacman" ]]; then
     shift 2
-    sudo script -q /dev/null -c "pacman $*"
+    cmd_str="$(printf 'pacman %q ' "$@")"
+    # -e is IMPORTANT: makes script return the child exit code (otherwise false “success” possible)
+    sudo script -q -e /dev/null -c "$cmd_str"
+    status=$?
+
   elif [[ "$1" == "yay" ]]; then
     shift 1
-    script -q /dev/null -c "yay $*"
+    cmd_str="$(printf 'yay %q ' "$@")"
+    script -q -e /dev/null -c "$cmd_str"
+    status=$?
+
   else
     "$@"
+    status=$?
   fi
 
-  local status=$?
-  if [ $status -ne 0 ]; then
-    echo -e "${red}Error: Command '$*' failed with exit code $status${reset}"
+  if (( status != 0 )); then
+    echo -e "${red}Error: Command '${pretty}' failed with exit code ${status}${reset}"
     return 1
-  else
-    echo -e "${green}Command '$*' completed successfully.${reset}"
-    return 0
   fi
+
+  echo -e "${green}Command '${pretty}' completed successfully.${reset}"
+  return 0
 }
 
-# Lock-handling prompt function
+# Lock-handling prompt function (correct + honest)
 prompt_for_db_lock_resolution() {
-  while [ -f /var/lib/pacman/db.lck ]; do
-    echo
-    echo -ne "${yellow}Pacman database is locked. (r)etry  (d)elete lock  (e)xit:${reset}"
-    read -rp "" choice
-    echo
+  while [[ -f /var/lib/pacman/db.lck ]]; do
+    echo > /dev/tty
+    echo -ne "${yellow}Pacman database is locked. (r)etry  (d)elete lock  (e)xit:${reset} " > /dev/tty
+    read -r choice < /dev/tty
+    echo > /dev/tty
 
     case "${choice,,}" in
       r)
-        echo -e "${cyan}Retrying in 5 seconds...${reset}"
+        echo -e "${cyan}Retrying in 5 seconds...${reset}" > /dev/tty
         sleep 5
         ;;
+
       d)
-        echo -e "${cyan}Deleting pacman lock file...${reset}"
-        if ! sudo fuser -v /var/lib/pacman/db.lck && ! sudo rm -f /var/lib/pacman/db.lck*; then
-          echo -e "${red}Warning: Failed to delete lock file. It may still be in use or require manual removal.${reset}"
+        echo -e "${cyan}Checking who holds the lock...${reset}" > /dev/tty
+
+        # If fuser reports a PID (exit 0), lock is in use -> DO NOT delete.
+        if sudo fuser -v /var/lib/pacman/db.lck >/dev/tty 2>&1; then
+          echo -e "${red}Lock appears to be in use. Not deleting.${reset}" > /dev/tty
+          echo -e "${yellow}Close pamac/Octopi or kill the shown PID, then retry.${reset}" > /dev/tty
+        else
+          echo -e "${cyan}No process reported. Deleting lock file...${reset}" > /dev/tty
+          if sudo rm -f /var/lib/pacman/db.lck*; then
+            echo -e "${green}Lock file deleted.${reset}" > /dev/tty
+          else
+            echo -e "${red}Failed to delete lock file.${reset}" > /dev/tty
+          fi
         fi
         ;;
+
       e)
-        echo -e "${red}Exiting due to pacman lock.${reset}"
+        echo -e "${red}Exiting due to pacman lock.${reset}" > /dev/tty
         exit 1
         ;;
+
       *)
-        echo -e "${red}Invalid choice. Try again.${reset}"
+        echo -e "${red}Invalid choice. Try again.${reset}" > /dev/tty
         ;;
     esac
   done
@@ -1257,18 +1288,32 @@ perform_updates() {
   echo
   prompt_for_db_lock_resolution
 
-  # Loop pacman + PGP handling until a clean attempt
+  # Default flags (global on purpose; your outer loop reads them)
+  pacman_failed=true
+  yay_failed=true
+
+  # Loop pacman + PGP handling until:
+  # - pacman succeeds, OR
+  # - pacman fails with no PGP signature issue (then we return and let outer retry prompt handle it)
   while true; do
-    pacman_tmp_log="/tmp/manjaro/pacman_attempt.log"
+    local pacman_tmp_log="/tmp/manjaro/pacman_attempt.log"
     : > "$pacman_tmp_log"
 
-    if pacman_rescue -Syyu --noconfirm 2>&1 | tee -a "$pacman_tmp_log"; then
+    # --- CRITICAL FIX: pipeline must reflect pacman_rescue exit, not tee exit ---
+    local had_pipefail=0
+    set -o | grep -q 'pipefail[[:space:]]*on' && had_pipefail=1
+    set -o pipefail
+
+    if pacman_rescue -Syyu --noconfirm --needed 2>&1 | tee -a "$pacman_tmp_log"; then
       pacman_failed=false
     else
       pacman_failed=true
     fi
 
-    # Check only this attempt for PGP signature errors
+    (( had_pipefail == 0 )) && set +o pipefail
+    # --- end fix ---
+
+    # If signature errors occurred, reset keyring and retry pacman inside this function
     if grep -qiE 'signature.*(could not be verified|invalid|error|unknown|revoked|failed)' "$pacman_tmp_log"; then
       echo
       echo -e "${red}PGP signature errors detected in pacman output.${reset}"
@@ -1285,22 +1330,37 @@ perform_updates() {
       continue
     fi
 
+    # No signature errors. If pacman failed for other reasons, stop here.
+    if [[ "$pacman_failed" == true ]]; then
+      echo
+      echo -e "${red}Pacman update failed (non-PGP). Not proceeding to AUR/yay steps.${reset}"
+      return 1
+    fi
+
     echo
-    echo -e "${orange}No PGP signature errors detected. ${cyan}Continuing...${reset}"
+    echo -e "${orange}Pacman update OK. Continuing...${reset}"
     break
   done
 
-  # List repo packages for AUR replacement
-  pacman -Sl core extra multilib | awk '{print $2}' | sort -u > /tmp/manjaro/repo_pkgs.txt
+  # Ensure repo list exists for any function that needs it
+  mkdir -p /tmp/manjaro
+  if ! pacman -Slq | sort -u > /tmp/manjaro/repo_pkgs.txt; then
+    echo
+    echo -e "${red}Failed to generate /tmp/manjaro/repo_pkgs.txt. Not proceeding.${reset}"
+    pacman_failed=true
+    return 1
+  fi
 
-  # Replace AUR packages that now exist in official repos (including known AUR variants)
+  # Replace AUR packages that now exist in official repos
   replace_aur_with_repo
 
   prompt_for_db_lock_resolution
-  if ! run_command yay -Syu --devel --timeupdate --noconfirm --cleanafter --editmenu=false --combinedupgrade --combinedupgrade; then
+
+  if ! run_command yay -Syu --devel --timeupdate --noconfirm --cleanafter --editmenu=false --combinedupgrade --needed; then
     echo
     echo -e "${red}Yay update failed.${reset}"
     yay_failed=true
+    return 1
   else
     yay_failed=false
   fi
@@ -1346,9 +1406,6 @@ if ! run_command gext update -y; then
 fi
 
 # Replace Flatpaks with repo packages (before Flatpak updates)
-if [[ ! -f /tmp/manjaro/repo_pkgs.txt ]]; then
-  pacman -Sl core extra multilib | awk '{print $2}' | sort -u > /tmp/manjaro/repo_pkgs.txt
-fi
 replace_flatpaks_with_repo
 
 # Flatpak updates sudo
@@ -1390,18 +1447,6 @@ if ! run_command bash -c "yes | sudo pacman -Scc"; then
   run_command sudo rm -rf /var/cache/pacman/pkg/*
 fi
 
-# Flatpak repair (system)
-if ! run_command sudo flatpak repair; then
-  echo
-  echo -e "${red}Flatpak system repair failed, continuing...${reset}"
-fi
-
-# Flatpak repair (user)
-if ! run_command flatpak repair --user; then
-  echo
-  echo -e "${red}Flatpak user repair failed, continuing...${reset}"
-fi
-
 # Flatpak clean orphaned components
 if ! run_command flatpak uninstall --unused -y; then
   echo
@@ -1440,6 +1485,128 @@ if [ ${#leftover_apps[@]} -ne 0 ]; then
 else
   echo
   echo -e "${cyan}No leftover Flatpak app data found.${reset}"
+fi
+echo -e "\n\n\n"
+
+# --- Extra Flatpak hygiene: prune stale exports + overrides (user + system) ---
+
+# Clean Flatpak exports (user) - fixes ghost desktop entries/icons
+# --- Flatpak exports hygiene (SAFE): remove only BROKEN export symlinks ---
+# This fixes "ghost" entries without deleting real launchers/icons.
+
+echo -e "${cyan}Checking Flatpak exports (user) for broken symlinks...${reset}"
+
+if [[ -d "$HOME/.local/share/flatpak/exports" ]]; then
+  mapfile -t broken_user < <(find "$HOME/.local/share/flatpak/exports" -xtype l 2>/dev/null)
+
+  if (( ${#broken_user[@]} > 0 )); then
+    echo
+    echo -e "${yellow}Broken user export links found:${reset}"
+    printf '%s\n' "${broken_user[@]}"
+    if find "$HOME/.local/share/flatpak/exports" -xtype l -delete 2>/dev/null; then
+      echo
+      echo -e "${green}Removed ${#broken_user[@]} broken Flatpak export links (user).${reset}"
+    else
+      echo
+      echo -e "${red}Failed to remove some broken Flatpak export links (user), continuing...${reset}"
+    fi
+  else
+    echo
+    echo -e "${cyan}No broken Flatpak export links (user) found.${reset}"
+  fi
+else
+  echo
+  echo -e "${cyan}No Flatpak exports directory (user) found.${reset}"
+fi
+echo -e "\n\n\n"
+
+
+echo -e "${cyan}Checking Flatpak exports (system) for broken symlinks...${reset}"
+
+if sudo test -d /var/lib/flatpak/exports; then
+  # Collect broken system links (if any)
+  mapfile -t broken_sys < <(sudo find /var/lib/flatpak/exports -xtype l 2>/dev/null)
+
+  if (( ${#broken_sys[@]} > 0 )); then
+    echo
+    echo -e "${yellow}Broken system export links found:${reset}"
+    printf '%s\n' "${broken_sys[@]}"
+    if sudo find /var/lib/flatpak/exports -xtype l -delete 2>/dev/null; then
+      echo
+      echo -e "${green}Removed ${#broken_sys[@]} broken Flatpak export links (system).${reset}"
+    else
+      echo
+      echo -e "${red}Failed to remove some broken Flatpak export links (system), continuing...${reset}"
+    fi
+  else
+    echo
+    echo -e "${cyan}No broken Flatpak export links (system) found.${reset}"
+  fi
+else
+  echo
+  echo -e "${cyan}No Flatpak exports directory (system) found.${reset}"
+fi
+echo -e "\n\n\n"
+
+# Remove orphaned Flatpak overrides (user)
+echo -e "${cyan}Checking for orphaned Flatpak overrides (user)...${reset}"
+if [[ -d "$HOME/.local/share/flatpak/overrides" ]]; then
+  mapfile -t orphan_overrides_user < <(
+    find "$HOME/.local/share/flatpak/overrides" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null \
+    | while read -r appid; do
+        flatpak info "$appid" >/dev/null 2>&1 || echo "$appid"
+      done
+  )
+
+  if (( ${#orphan_overrides_user[@]} > 0 )); then
+    echo
+    echo -e "${yellow}Orphaned user overrides:${reset}"
+    printf '%s\n' "${orphan_overrides_user[@]}"
+    if ! run_command bash -c "rm -f -- $(printf '%q ' "${orphan_overrides_user[@]/#/$HOME/.local/share/flatpak/overrides/}")"; then
+      echo
+      echo -e "${red}Failed to remove some user overrides, continuing...${reset}"
+    else
+      echo
+      echo -e "${green}Orphaned user overrides removed.${reset}"
+    fi
+  else
+    echo
+    echo -e "${cyan}No orphaned user overrides found.${reset}"
+  fi
+else
+  echo
+  echo -e "${cyan}No user overrides directory found.${reset}"
+fi
+echo -e "\n\n\n"
+
+# Remove orphaned Flatpak overrides (system)
+echo -e "${cyan}Checking for orphaned Flatpak overrides (system)...${reset}"
+if [[ -d "/var/lib/flatpak/overrides" ]]; then
+  mapfile -t orphan_overrides_sys < <(
+    sudo find /var/lib/flatpak/overrides -maxdepth 1 -type f -printf '%f\n' 2>/dev/null \
+    | while read -r appid; do
+        sudo flatpak info "$appid" >/dev/null 2>&1 || echo "$appid"
+      done
+  )
+
+  if (( ${#orphan_overrides_sys[@]} > 0 )); then
+    echo
+    echo -e "${yellow}Orphaned system overrides:${reset}"
+    printf '%s\n' "${orphan_overrides_sys[@]}"
+    if ! run_command bash -c "sudo rm -f -- $(printf '%q ' "${orphan_overrides_sys[@]/#//var/lib/flatpak/overrides/}")"; then
+      echo
+      echo -e "${red}Failed to remove some system overrides, continuing...${reset}"
+    else
+      echo
+      echo -e "${green}Orphaned system overrides removed.${reset}"
+    fi
+  else
+    echo
+    echo -e "${cyan}No orphaned system overrides found.${reset}"
+  fi
+else
+  echo
+  echo -e "${cyan}No system overrides directory found.${reset}"
 fi
 echo -e "\n\n\n"
 
