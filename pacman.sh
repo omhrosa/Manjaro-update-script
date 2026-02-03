@@ -17,85 +17,6 @@ purple='\033[38;5;105m'        # Progress bar
 blue='\033[38;5;39m'           # Extra info (summaries)
 reset='\033[0m'                # Commands output
 
-# --- Error tracking for end-of-script report ---
-ERROR_COUNT=0
-ERRORS=()
-
-log_error() {
-  local cmd="$1"
-  local code="$2"
-  ERRORS+=("[exit ${code}] ${cmd}")
-  ((ERROR_COUNT++))
-}
-
-# --- Auto-capture failing commands (even if they didn't use runcommand) ---
-__last_cmd=""
-__last_ctx=""
-__err_trap_active=0
-
-__debug_capture() {
-  # Don't capture commands while we're running traps/handlers (prevents false attribution).
-  case "${FUNCNAME[1]:-}" in
-    __err_handler|on_exit) return 0 ;;
-  esac
-
-  # Avoid polluting capture while inside the error handler itself.
-  (( __err_trap_active )) && return 0
-  __last_cmd="$BASH_COMMAND"
-  __last_ctx="line ${BASH_LINENO[0]} in ${FUNCNAME[1]:-MAIN}"
-}
-
-__err_handler() {
-  local rc=$?
-
-  # Prevent recursion if the handler itself triggers ERR/DEBUG activity.
-  (( __err_trap_active )) && return "$rc"
-  __err_trap_active=1
-
-  # Only log if we actually have something meaningful.
-  if [[ -n "${__last_cmd}" ]]; then
-    log_error "${__last_cmd} (${__last_ctx})" "$rc"
-  fi
-
-  __err_trap_active=0
-  return "$rc"
-}
-
-# Make ERR trap propagate into functions/subshells invoked by the script.
-set -o errtrace
-
-# Make DEBUG trap propagate into functions too (so __last_cmd is accurate inside functions).
-set -o functrace
-
-# Record every command; on failure, ERR trap logs the recorded command.
-trap '__debug_capture' DEBUG
-trap '__err_handler' ERR
-
-print_errors_summary() {
-
-  if (( ERROR_COUNT == 0 )); then
-    echo -e "${green}No errors detected during this run.${reset}"
-    return 0
-  fi
-
-  echo -e "${red}Total errors:${reset} ${orange}${ERROR_COUNT}${reset}"
-  echo
-  echo -e "Errors list:"
-  echo
-
-  local i=1
-  local e
-  for e in "${ERRORS[@]}"; do
-    echo -e "${red}${i})${reset} ${e}"
-    ((i++))
-  done
-
-  # Optional pointer to full log (you already set log_path)
-  if [[ -n "${log_path:-}" ]]; then
-    echo
-    echo -e "${blue}Full log:${reset} ${log_path}"
-  fi
-}
 
 # --- Static top progress bar (centered) ---
 PROG_WIDTH=20
@@ -167,9 +88,6 @@ SUDOREFRESHPID=$!
 on_exit() {
   local rc=$?
 
-  print_errors_summary
-  echo 
-
   # Cleanly end the progress UI
   progress_ui_end
 
@@ -209,7 +127,7 @@ cp -f "$cleaned_tmp" "$HOME/$final_filename"
 # Clean /tmp
 rm -rf /tmp/manjaro
 
-  return "$rc"
+   exit "$rc"
 }
 
 trap on_exit EXIT INT TERM
@@ -1337,8 +1255,6 @@ perform_updates() {
       return 1
     fi
 
-    echo
-    echo -e "${orange}Pacman update OK. Continuing...${reset}"
     break
   done
 
@@ -1368,7 +1284,59 @@ perform_updates() {
   return 0
 }
 
-# Replace AUR packages that now exist in official repos (including known AUR variants)
+rebuild_aur_if_needed() {
+  echo -e "\n\n"
+  echo -e "${orange}Checking for packages that need rebuild (rebuild-detector)...${reset}"
+
+  if ! command -v checkrebuild >/dev/null 2>&1; then
+    echo -e "${yellow}rebuild-detector not installed; skipping rebuild check.${reset}"
+    echo -e "${yellow}Install: sudo pacman -S rebuild-detector${reset}"
+    return 0
+  fi
+
+  # checkrebuild output format is typically: "<repo>\t<pkgname>"
+  # If nothing needs rebuild, it prints nothing.
+  mapfile -t need_rebuild < <(checkrebuild | awk 'NF{print $NF}' | sort -u)
+
+  if (( ${#need_rebuild[@]} == 0 )); then
+    echo -e "${green}No rebuilds needed.${reset}"
+    return 0
+  fi
+
+  # Build a fast lookup table of installed AUR packages
+    local -A is_aur=()
+  while read -r p _; do
+    [[ -n "$p" ]] && is_aur["$p"]=1
+  done < <(pacman -Qm)
+
+  # Filter rebuild list -> only AUR packages you actually have installed
+  local -a aur_to_rebuild=()
+  for p in "${need_rebuild[@]}"; do
+    if [[ -n "${is_aur[$p]:-}" ]]; then
+      aur_to_rebuild+=("$p")
+    fi
+  done
+
+  if (( ${#aur_to_rebuild[@]} == 0 )); then
+    echo -e "${yellow}Rebuild-detector flagged packages, but none are installed AUR packages. Skipping yay rebuild.${reset}"
+    echo -e "${blue}Flagged:${reset} ${need_rebuild[*]}"
+    return 0
+  fi
+
+  echo -e "${orange}AUR packages to rebuild:${reset} ${aur_to_rebuild[*]}"
+
+  # Force rebuild (yay rebuild flags have been historically messy across versions,
+  # but --rebuildtree is the intended approach; yay will still reinstall/build.)
+  if ! run_command yay -S --noconfirm --rebuild --rebuildtree --cleanafter --editmenu=false "${aur_to_rebuild[@]}"; then
+    echo
+    echo -e "${red}AUR rebuild step failed.${reset}"
+    return 1
+  fi
+
+  echo -e "${green}AUR rebuild step completed.${reset}"
+  return 0
+}
+
 
 # Run updates first time
 perform_updates
@@ -1395,6 +1363,11 @@ while [[ "$pacman_failed" == true || "$yay_failed" == true ]]; do
   esac
 done
 # Perform updates
+
+
+rebuild_aur_if_needed || echo -e "${yellow}Rebuild skipped/failed.${reset}"
+
+
 ((++current_step)); show_progress $current_step $total_steps
 
 echo -e "\n\n\n\n${purple}$(printf '%*s' 43 '' | tr ' ' '-') Extensions-Flatpaks updates $(printf '%*s' 43 '' | tr ' ' '-')${reset}"
@@ -1455,7 +1428,7 @@ fi
 echo -e "\n\n\n"
 
 # Remove unowned Flatpak app data (Flatpak-native)
-# NOTE: "--delete-data" without a REF removes all "unowned" app data.
+# NOTE: "--delete-data" without a REF removes all unowned app data.
 echo -e "${cyan}Running: flatpak uninstall --delete-data -y${reset}\n"
 
 flatpak uninstall --delete-data -y
@@ -2319,11 +2292,9 @@ print("\n".join(sorted(out, key=lambda s: tuple(map(int,s.split("."))))))
   if [[ -z "$latest_inst_mm" ]] || \
      [[ "$(printf '%s\n%s\n' "$latest_inst_mm" "$latest_avail_mm" | sort -V | tail -n1)" != "$latest_inst_mm" ]]; then
     echo -e "${red}Newer LTS kernel series available: ${orange}${latest_avail_k}${reset} (installed LTS: ${latest_inst_k:-none})"
-    echo
   fi
 }
 
 # Usage:
 # check_newer_manjaro_lts_kernel
 check_newer_manjaro_lts_kernel
-
