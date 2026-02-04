@@ -5,7 +5,7 @@
 # Notes:
 # - This script is interactive and uses sudo.
 # - Output is logged under /tmp/manjaro/ and a cleaned log is saved to $HOME.
-# - Error reporting uses Bash traps; line numbers may shift if whitespace changes.
+
 
 # ANSI color codes
 cyan='\033[38;5;38m'           # Running command
@@ -94,41 +94,46 @@ on_exit() {
   # Stop sudo keepalive
   [[ -n "${SUDOREFRESHPID:-}" ]] && kill "$SUDOREFRESHPID" 2>/dev/null || true
 
-  # Keep the terminal open so you can actually see the report
- #printf "%b" "${yellow}Press Enter to close...${reset}"
- read -r </dev/tty
+  # If logging was never initialized, just clean /tmp and leave.
+  if [[ -z "${log_path:-}" || ! -f "${log_path:-}" ]]; then
+    rm -rf /tmp/manjaro 2>/dev/null || true
+    exit "$rc"
+  fi
 
-# Stop logging - Final log
-exec 1>&3 2>&4
+  # Restore stdout/stderr only if we actually saved them
+  if { true >&3; } 2>/dev/null && { true >&4; } 2>/dev/null; then
+    exec 1>&3 2>&4
+  fi
 
-# Reuse datetime_str from earlier logging step
-# final_filename must match log file name (used in $log_path)
-final_filename="Update-${datetime_str}.log"
+  # Reuse datetime_str from earlier logging step (fallback if missing)
+  local dt="${datetime_str:-$(date +'%F_%H-%M-%S')}"
+  final_filename="Update-${dt}.log"
 
-# Temp file in tmpfs
-cleaned_tmp="/tmp/manjaro/cleaned_tmp.log"
+  # Temp file in tmpfs
+  cleaned_tmp="/tmp/manjaro/cleaned_tmp.log"
 
-# Clean the log: remove ANSI codes and non-printables
-sed -E 's/\x1B\[[0-9;?]*[A-Za-z]//g; s/\x1B\][^\x07\x1B]*(\x07|\x1B\\)//g' "$log_path" | \
-tr -cd '\11\12\15\40-\176' | \
-awk '
+  # Clean the log: remove ANSI codes and non-printables
+  sed -E 's/\x1B\[[0-9;?]*[A-Za-z]//g; s/\x1B\][^\x07\x1B]*(\x07|\x1B\\)//g' "$log_path" | \
+  tr -cd '\11\12\15\40-\176' | \
+  awk '
 BEGIN { skip = 0 }
 /^ *8.888888888e+09/ { skip = 1 }
 skip && /88P" */ { skip = 0; next }
 skip == 0 { print }
 ' > "$cleaned_tmp"
 
-# Delete existing logs before saving new one
-find $HOME -maxdepth 1 -type f -name 'Update-*.log' -exec rm -f {} \;
+  # Delete existing logs before saving new one
+  find "$HOME" -maxdepth 1 -type f -name 'Update-*.log' -exec rm -f {} \;
 
-# Copy cleaned log to final destination with Greek timestamped name
-cp -f "$cleaned_tmp" "$HOME/$final_filename"
+  # Copy cleaned log to final destination
+  cp -f "$cleaned_tmp" "$HOME/$final_filename"
 
-# Clean /tmp
-rm -rf /tmp/manjaro
+  # Clean /tmp
+  rm -rf /tmp/manjaro
 
-   exit "$rc"
+  exit "$rc"
 }
+
 
 trap on_exit EXIT INT TERM
 
@@ -2357,3 +2362,7 @@ print("\n".join(sorted(out, key=lambda s: tuple(map(int,s.split("."))))))
 # Usage:
 # check_newer_manjaro_lts_kernel
 check_newer_manjaro_lts_kernel
+
+# Keep the terminal open so you can actually see the report
+ #printf "%b" "${yellow}Press Enter to close...${reset}"
+ read -r </dev/tty
