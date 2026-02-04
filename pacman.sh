@@ -701,6 +701,13 @@ if (( NO_ISSUE_PERCENT < 85 || VOTERS < 200 )); then
   echo -e "\n\n"
 fi
 
+# Proceed with update prompt
+echo -ne "${yellow}Proceed with the update? (n)o or any other key: ${reset}"
+read -rp "" update
+if [[ "${update,,}" = "n" ]]; then
+  exit
+fi
+
 
 echo -e "\n\n\n\n${purple}$(printf '%*s' 49 '' | tr ' ' '-') Mirrors refresh $(printf '%*s' 49 '' | tr ' ' '-')${reset}"
 
