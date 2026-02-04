@@ -491,32 +491,89 @@ else
 fi
 echo
 
-#Latest stable topic info
-CATEGORY_HTML="/tmp/manjaro/category.html"
+#Latest stable topic info (JSON, file-based, newest created)
+CATEGORY_JSON="/tmp/manjaro/category.json"
 TOPIC_JSON="/tmp/manjaro/topic.json"
 
-# Download the category page
-curl -s "https://forum.manjaro.org/c/announcements/stable-updates/12" -o "$CATEGORY_HTML"
+# Download category JSON (Discourse)
+if ! curl -fsSL -A 'Mozilla/5.0' \
+  "https://forum.manjaro.org/c/announcements/stable-updates/12.json" \
+  -o "$CATEGORY_JSON"; then
 
-# Extract first topic URL inside tbody with exact <a> pattern
-FIRST_TOPIC_URL=$(sed -n '/<tbody>/,/<\/tbody>/p' "$CATEGORY_HTML" | \
-  grep -Po "<a itemprop='url' href='\K[^']+(?=' class='title raw-link raw-topic-link')" | head -1)
+  FIRST_TOPIC_URL=""
+  TOPIC_JSON_URL=""
+  VOTERS=0
+  NO_ISSUE_VOTES=0
 
-# Append .json to get topic JSON URL
-TOPIC_JSON_URL="${FIRST_TOPIC_URL}.json"
+else
+  # Extract newest-created non-pinned topic -> build URL
+  FIRST_TOPIC_URL="$(
+    python3 - <<'PY' "$CATEGORY_JSON" 2>/dev/null
+import json,sys
+d=json.load(open(sys.argv[1]))
+topics=sorted(d["topic_list"]["topics"], key=lambda t: t.get("created_at",""), reverse=True)
+for t in topics:
+    if not t.get("pinned", False):
+        print(f'https://forum.manjaro.org/t/{t["slug"]}/{t["id"]}')
+        break
+PY
+  )"
 
-# Download the topic JSON data
-curl -s "$TOPIC_JSON_URL" -o "$TOPIC_JSON"
+  if [[ -n "$FIRST_TOPIC_URL" ]]; then
+    TOPIC_JSON_URL="${FIRST_TOPIC_URL}.json"
 
-# Extract total voters
-VOTERS=$(grep -oP '\"voters\":\K[0-9]+' "$TOPIC_JSON" | head -1)
+    # Download topic JSON
+    if curl -fsSL -A 'Mozilla/5.0' "$TOPIC_JSON_URL" -o "$TOPIC_JSON"; then
 
-# Extract no issue votes count
-NO_ISSUE_VOTES=$(grep -oP 'No issue, everything went smoothly\",\"votes\":\K[0-9]+' "$TOPIC_JSON" | head -1)
+      # Extract voters + "no issue" votes from poll (search any post returned)
+      read -r VOTERS NO_ISSUE_VOTES <<<"$(
+        python3 - <<'PY' "$TOPIC_JSON" 2>/dev/null
+import json,sys
+d=json.load(open(sys.argv[1]))
+posts=d.get("post_stream",{}).get("posts",[])
 
-# Sanity check to avoid division by zero
+poll=None
+for p in posts:
+    pls=p.get("polls") or []
+    if pls:
+        poll=pls[0]
+        break
+
+if not poll:
+    print("0 0"); raise SystemExit
+
+voters=int(poll.get("voters",0) or 0)
+no_issue=0
+
+for opt in poll.get("options",[]):
+    txt=(opt.get("html","") or "").lower()
+    # match both "No issue" and "No issues"
+    if "no issu" in txt or "smooth" in txt:
+        no_issue=int(opt.get("votes",0) or 0)
+        break
+
+print(voters, no_issue)
+PY
+      )"
+
+      VOTERS="${VOTERS:-0}"
+      NO_ISSUE_VOTES="${NO_ISSUE_VOTES:-0}"
+
+    else
+      VOTERS=0
+      NO_ISSUE_VOTES=0
+    fi
+
+  else
+    TOPIC_JSON_URL=""
+    VOTERS=0
+    NO_ISSUE_VOTES=0
+  fi
+fi
+
+# Sanity check to avoid division by zero (your original logic/echo preserved)
 if [[ -n "$VOTERS" && "$VOTERS" -ne 0 ]]; then
-  NO_ISSUE_PERCENT=$(( 100 * NO_ISSUE_VOTES / VOTERS ))
+  NO_ISSUE_PERCENT=$(( (100 * NO_ISSUE_VOTES + VOTERS/2) / VOTERS ))
   PERCENT_TEXT="${NO_ISSUE_PERCENT}"
 else
   NO_ISSUE_PERCENT=-1  # use sentinel for "N/A"
@@ -525,6 +582,8 @@ fi
 
 echo -e "No issue: ${orange}${PERCENT_TEXT}${reset}%  Total votes: ${VOTERS:-0}"
 echo
+
+
 
 # Packages count
 aur_count=$(pacman -Qm | wc -l)
@@ -1286,7 +1345,7 @@ perform_updates() {
 
 rebuild_aur_if_needed() {
   echo -e "\n\n"
-  echo -e "${orange}Checking for packages that need rebuild (rebuild-detector)...${reset}"
+  echo -e "${cyan}Checking for packages that need rebuild (rebuild-detector)...${reset}"
 
   if ! command -v checkrebuild >/dev/null 2>&1; then
     echo -e "${yellow}rebuild-detector not installed; skipping rebuild check.${reset}"
