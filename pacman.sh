@@ -623,14 +623,14 @@ run_command() {
 
   if [[ "$1" == "sudo" && "$2" == "pacman" ]]; then
     shift 2
-    cmd_str="$(printf 'pacman %q ' "$@")"
+   cmd_str="$(printf '%q ' pacman "$@")"
     # -e is IMPORTANT: makes script return the child exit code (otherwise false “success” possible)
     sudo script -q -e /dev/null -c "$cmd_str"
     status=$?
 
   elif [[ "$1" == "yay" ]]; then
     shift 1
-    cmd_str="$(printf 'yay %q ' "$@")"
+    cmd_str="$(printf '%q ' yay "$@")"
     script -q -e /dev/null -c "$cmd_str"
     status=$?
 
@@ -701,12 +701,6 @@ if (( NO_ISSUE_PERCENT < 85 || VOTERS < 200 )); then
   echo -e "\n\n"
 fi
 
-# Proceed with update prompt
-echo -ne "${yellow}Proceed with the update? (n)o or any other key: ${reset}"
-read -rp "" update
-if [[ "${update,,}" = "n" ]]; then
-  exit
-fi
 
 echo -e "\n\n\n\n${purple}$(printf '%*s' 49 '' | tr ' ' '-') Mirrors refresh $(printf '%*s' 49 '' | tr ' ' '-')${reset}"
 
@@ -827,6 +821,41 @@ fi
 ((++current_step)); show_progress $current_step $total_steps
 
 echo -e "\n\n\n\n${purple}$(printf '%*s' 48 '' | tr ' ' '-') Packages updates $(printf '%*s' 49 '' | tr ' ' '-')${reset}"
+
+
+# ---- Dry-run preview AFTER mirrors refresh (fixed) ----
+prompt_for_db_lock_resolution
+
+echo -e "\n\n\n"
+echo -e "${yellow}Checking real update size (dry run)...${reset}"
+
+# Refresh sync DBs (quiet)
+sudo pacman -Sy --noconfirm >/dev/null
+
+# List real repo upgrades
+mapfile -t repo_up < <(pacman -Qu 2>/dev/null)
+
+if (( ${#repo_up[@]} == 0 )); then
+  echo -e "Packages to update (repo): 0"
+  echo -e "Total download size (repo): 0.00 MiB"
+else
+  echo -e "Packages to update (repo): ${#repo_up[@]}"
+  printf '%s\n' "${repo_up[@]}" | sed 's/^/  - /'
+
+  # Download size for repo upgrades only
+  total_bytes="$(sudo pacman -Sup --print-format '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+  awk -v b="$total_bytes" 'BEGIN{printf "Total download size (repo): %.2f MiB\n", b/1024/1024}'
+fi
+
+echo
+echo -ne "${yellow}Proceed with the update? (n)o or any other key: ${reset}"
+read -rp "" update
+if [[ "${update,,}" = "n" ]]; then
+  exit
+fi
+# ---- End dry-run preview ----
+
+
 
 # Perform updates
 
@@ -1286,7 +1315,7 @@ perform_updates() {
     set -o | grep -q 'pipefail[[:space:]]*on' && had_pipefail=1
     set -o pipefail
 
-    if pacman_rescue -Syyu --noconfirm --needed 2>&1 | tee -a "$pacman_tmp_log"; then
+    if pacman_rescue -Syyu --noconfirm 2>&1 | tee -a "$pacman_tmp_log"; then
       pacman_failed=false
     else
       pacman_failed=true
@@ -1336,7 +1365,7 @@ perform_updates() {
 
   prompt_for_db_lock_resolution
 
-  if ! run_command yay -Syu --devel --timeupdate --noconfirm --cleanafter --editmenu=false --combinedupgrade --needed; then
+  if ! run_command yay -Syu --devel --timeupdate --noconfirm --cleanafter --editmenu=false --combinedupgrade ; then
     echo
     echo -e "${red}Yay update failed.${reset}"
     yay_failed=true
