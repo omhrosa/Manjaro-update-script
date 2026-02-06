@@ -1,69 +1,71 @@
 #!/bin/bash
-
-# System update / maintenance helper for Manjaro (pacman/yay/flatpak).
-#
-# Notes:
-# - This script is interactive and uses sudo.
-# - Output is logged under /tmp/manjaro/ and a cleaned log is saved to $HOME.
+# System update/maintenance script for Manjaro.
 
 
-# ANSI color codes
-cyan='\033[38;5;38m'           # Running command
-red='\033[38;5;162m'           # Command failure or file deletion
-yellow='\033[38;5;178m'        # User input
-orange='\033[38;5;173m'        # Distinct info
-green='\033[38;5;77m'          # Command success
-purple='\033[38;5;105m'        # Progress bar
-blue='\033[38;5;39m'           # Extra info (summaries)
-reset='\033[0m'                # Commands output
 
+# Define UI colors
+cyan='\033[38;5;38m'
+red='\033[38;5;162m'
+yellow='\033[38;5;178m'
+orange='\033[38;5;173m'
+green='\033[38;5;77m'
+purple='\033[38;5;105m'
+blue='\033[38;5;39m'
+reset='\033[0m'
 
-# --- Static top progress bar (centered) ---
+# Progress UI config
 PROG_WIDTH=20
-total_steps=5  # Update this if you add/remove major blocks
+total_steps=5
 current_step=0
-
-# Title text prefix (keep simple: no ANSI colors in title)
 TITLE_PREFIX="Update"
 
+
+
+# Set terminal window title without polluting logs.
+# Uses OSC sequences written to /dev/tty for safety.
 set_term_title() {
-  # OSC 0: set icon name + window title: ESC ] 0 ; string BEL
-  # Write to /dev/tty so it never pollutes your logged stdout/stderr.
   local tty="/dev/tty"
   local title="$1"
   printf '\033]0;%s\007' "$title" >"$tty"
 }
 
+
+
+# Initialize the progress UI and set the initial title.
+# Keeps terminal scrollback intact (no scroll-region hacks).
 progress_ui_init() {
-  # No scroll-region manipulation (no tput csr), so GNOME Terminal scrollback keeps working.
   show_progress "$current_step" "$total_steps"
 }
 
+# Finalize the progress UI state.
+# Leaves the terminal title in a clean, predictable state.
 progress_ui_end() {
-  # Optional: leave final title; change text if you want.
   set_term_title "${TITLE_PREFIX}"
 }
 
+
+
+# Compute and render the progress bar title string.
+# Updates the terminal title with percent and bar state.
 show_progress() {
   local current="$1"
   local total="$2"
-
   (( total <= 0 )) && total=1
   (( current < 0 )) && current=0
   (( current > total )) && current=$total
-
   local percent=$(( 100 * current / total ))
   local filled=$(( PROG_WIDTH * current / total ))
   local empty=$(( PROG_WIDTH - filled ))
-
   local done_sub_bar todo_sub_bar text
   done_sub_bar=$(printf "%${filled}s" "" | tr " " "#")
   todo_sub_bar=$(printf "%${empty}s" "" | tr " " "-")
   text="[${done_sub_bar}${todo_sub_bar}] ${percent}%"
-
   set_term_title "${TITLE_PREFIX}  ${text}"
 }
 
+
+
+# Print the startup banner.
 echo -ne "${cyan}"
 echo '    888     888               888          888                 .d8888b.                   d8b          888   '
 echo '    888     888               888          888                d88P  Y88b                  Y8P          888   '
@@ -77,42 +79,30 @@ echo '                888                                                       
 echo '                888                                                                           888            '
 echo '                888                                                                                          '
 echo -ne "${reset}"
-
-# Keep sudo alive during the script
 echo -e "\n\n"
 echo -ne "${yellow}"
-sudo -v
-(sudo -v && while sleep 60; do sudo -n -v || exit; done) &
-SUDOREFRESHPID=$!
 
+
+
+# Prompt for sudo once and validate privileges.
+sudo -v
+
+# Handle cleanup and log finalization on exit or interruption.
+# Stops sudo keepalive, cleans tmp logs, and restores stdio.
 on_exit() {
   local rc=$?
-
-  # Cleanly end the progress UI
   progress_ui_end
-
-  # Stop sudo keepalive
   [[ -n "${SUDOREFRESHPID:-}" ]] && kill "$SUDOREFRESHPID" 2>/dev/null || true
-
-  # If logging was never initialized, just clean /tmp and leave.
   if [[ -z "${log_path:-}" || ! -f "${log_path:-}" ]]; then
     rm -rf /tmp/manjaro 2>/dev/null || true
     exit "$rc"
   fi
-
-  # Restore stdout/stderr only if we actually saved them
   if { true >&3; } 2>/dev/null && { true >&4; } 2>/dev/null; then
     exec 1>&3 2>&4
   fi
-
-  # Reuse datetime_str from earlier logging step (fallback if missing)
   local dt="${datetime_str:-$(date +'%F_%H-%M-%S')}"
   final_filename="Update-${dt}.log"
-
-  # Temp file in tmpfs
   cleaned_tmp="/tmp/manjaro/cleaned_tmp.log"
-
-  # Clean the log: remove ANSI codes and non-printables
   sed -E 's/\x1B\[[0-9;?]*[A-Za-z]//g; s/\x1B\][^\x07\x1B]*(\x07|\x1B\\)//g' "$log_path" | \
   tr -cd '\11\12\15\40-\176' | \
   awk '
@@ -121,105 +111,253 @@ BEGIN { skip = 0 }
 skip && /88P" */ { skip = 0; next }
 skip == 0 { print }
 ' > "$cleaned_tmp"
-
-  # Delete existing logs before saving new one
   find "$HOME" -maxdepth 1 -type f -name 'Update-*.log' -exec rm -f {} \;
-
-  # Copy cleaned log to final destination
   cp -f "$cleaned_tmp" "$HOME/$final_filename"
-
-  # Clean /tmp
   rm -rf /tmp/manjaro
-
   exit "$rc"
 }
 
-
+# Arm exit traps after defining cleanup.
+# Ensures logs and temp files are always finalized safely.
 trap on_exit EXIT INT TERM
+
+# Keep sudo alive during the run (killed by on_exit trap).
+(while sleep 60; do sudo -n -v || exit; done) &
+SUDOREFRESHPID=$!
+clear
+
+
+
+# Clock sanity gate
+clock_sanity_gate() {
+  local max_drift_ms=5000   # 5 seconds, strict
+  local auto_tried=false
+  local drift_ms ans
+
+  get_drift_ms() {
+    [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]] || return 1
+
+    # Parse: Offset: +9.083ms -> "9.083"
+    local ms
+    ms="$(timedatectl timesync-status 2>/dev/null | awk '/Offset:/{
+      v=$2; gsub(/[+]|ms/,"",v); print v
+    }')"
+    [[ -n "$ms" ]] || return 1
+
+    # Convert to integer milliseconds (absolute), rounded
+    awk -v o="$ms" 'BEGIN{
+      if (o < 0) o = -o;
+      printf "%.0f\n", o
+    }'
+  }
+
+  while true; do
+    if drift_ms="$(get_drift_ms)"; then
+      (( drift_ms <= max_drift_ms )) && return 0
+      echo "ERROR: Clock drift ~${drift_ms}ms (limit ${max_drift_ms}ms). Updates will fail (PGP/HTTPS)."
+    else
+      echo "ERROR: Clock not synchronized (can't read NTP offset)."
+    fi
+
+    if [[ "$auto_tried" == false ]]; then
+      auto_tried=true
+      echo "Trying one automatic NTP resync..."
+      sudo systemctl restart systemd-timesyncd || true
+      sleep 5
+      continue
+    fi
+
+    read -rp "Retry NTP (r)esync or (e)xit? " ans
+    case "${ans,,}" in
+      r) sudo systemctl restart systemd-timesyncd || true; sleep 5 ;;
+      e) echo "Exiting. Fix time sync and rerun."; exit 1 ;;
+      *) echo "Invalid choice. Exiting."; exit 1 ;;
+    esac
+  done
+}
+
+clock_sanity_gate
+clear
+
+
+
+# Verify all hard dependencies up front and fail fast if missing.
+# Offers one-shot install of missing repo/AUR packages, or exits.
+deps_check_and_install() {
+  # Collect missing commands and map them to packages.
+  local -a repo_pkgs=()
+  local -a aur_pkgs=()
+  local -a missing_cmds=()
+  local need_yay=0
+  local cmd
+
+  # Commands used by the script (explicitly checked)
+  for cmd in \
+    pacman-mirrors curl smartctl snapper grub-mkconfig flatpak yay gext checkrebuild fuser \
+    python3 timedatectl findmnt lsblk realpath script mhwd-kernel meld gnome-text-editor xdg-open \
+    awk sed tr find grep sort comm stat df \
+  ; do
+    command -v "$cmd" >/dev/null 2>&1 || missing_cmds+=("$cmd")
+  done
+
+  ((${#missing_cmds[@]}==0)) && return 0
+
+  command -v yay >/dev/null 2>&1 || need_yay=1
+
+  for cmd in "${missing_cmds[@]}"; do
+    case "$cmd" in
+      # Existing mappings
+      smartctl) repo_pkgs+=(smartmontools) ;;
+      snapper) repo_pkgs+=(snapper) ;;
+      grub-mkconfig) repo_pkgs+=(grub) ;;
+      pacman-mirrors) repo_pkgs+=(pacman-mirrors) ;;
+      curl) repo_pkgs+=(curl) ;;
+      flatpak) repo_pkgs+=(flatpak) ;;
+      yay) repo_pkgs+=(yay) ;;
+      gext) aur_pkgs+=(gnome-extensions-cli) ;;
+      checkrebuild) aur_pkgs+=(rebuild-detector) ;;
+      fuser) repo_pkgs+=(psmisc) ;;
+
+      # Added mappings (repo)
+      python3) repo_pkgs+=(python) ;;
+      timedatectl) repo_pkgs+=(systemd) ;;
+
+      findmnt|lsblk|script) repo_pkgs+=(util-linux) ;;
+      mhwd-kernel) repo_pkgs+=(mhwd) ;;
+      xdg-open) repo_pkgs+=(xdg-utils) ;;
+      meld) repo_pkgs+=(meld) ;;
+      gnome-text-editor) repo_pkgs+=(gnome-text-editor) ;;
+
+      awk) repo_pkgs+=(gawk) ;;
+      sed) repo_pkgs+=(sed) ;;
+      grep) repo_pkgs+=(grep) ;;
+      find) repo_pkgs+=(findutils) ;;
+
+      # Coreutils-provided commands
+      realpath|stat|df|tr|sort|comm) repo_pkgs+=(coreutils) ;;
+
+      # If something unexpected is missing, be explicit
+      *) ;;
+    esac
+  done
+
+  # De-duplicate
+  local -a uniq_repo=() uniq_aur=()
+  local p
+  for p in "${repo_pkgs[@]}"; do
+    [[ " ${uniq_repo[*]} " == *" $p "* ]] || uniq_repo+=("$p")
+  done
+  for p in "${aur_pkgs[@]}"; do
+    [[ " ${uniq_aur[*]} " == *" $p "* ]] || uniq_aur+=("$p")
+  done
+
+  echo
+  echo -e "${yellow}Missing hard dependencies detected.${reset}"
+  echo -e "${orange}Missing commands:${reset} ${missing_cmds[*]}"
+  ((${#uniq_repo[@]})) && echo -e "${orange}Repo packages:${reset} ${uniq_repo[*]}"
+  ((${#uniq_aur[@]})) && echo -e "${orange}AUR packages:${reset} ${uniq_aur[*]}"
+  echo -ne "${yellow}Install all missing dependencies now? [y/N]: ${reset}"
+  read -r ans
+  [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]] || return 1
+
+  # Install yay first, then install repo deps and finally AUR deps.
+  if ((need_yay)); then
+    sudo pacman -S --needed --noconfirm yay || return 1
+    # Remove yay from repo list so it isn't reinstalled
+    local -a tmp=()
+    for p in "${uniq_repo[@]}"; do
+      [[ "$p" == "yay" ]] || tmp+=("$p")
+    done
+    uniq_repo=("${tmp[@]}")
+  fi
+
+  if ((${#uniq_repo[@]})); then
+    sudo pacman -S --needed --noconfirm "${uniq_repo[@]}" || return 1
+  fi
+  if ((${#uniq_aur[@]})); then
+    yay -S --needed --noconfirm "${uniq_aur[@]}" || return 1
+  fi
+
+  return 0
+}
+deps_check_and_install || exit 1
+
+
 
 echo -ne "${reset}"
 clear
-
 progress_ui_init
 show_progress "$current_step" "$total_steps"
 
-# Create /tmp/manjaro if it doesn't exist
+
+
+# Initialize tmp workspace and enable logging.
+# Duplicates output to screen while tee-ing to a tmpfs log.
 rm -rf /tmp/manjaro
 mkdir -p /tmp/manjaro
-
-# Log update to file in tmpfs
-# Save original stdout and stderr
 exec 3>&1 4>&2
-
-# Define log path in /tmp/manjaro/
 log_dir="/tmp/manjaro/"
 datetime_str=$(LC_TIME=el_GR.UTF-8 date +'%A_%d_%B_%I-%M%p')
 log_file="Update-${datetime_str}.log"
 log_path="${log_dir}${log_file}"
-
-# Redirect all stdout and stderr to tee: live output + logging in tmpfs
 exec > >(tee -a "$log_path") 2>&1
 
-# --- NVMe SMART health gate (run early) ---
 
-echo -e "\n${orange}Checking NVMe SMART health...${reset}"
 
-if ! command -v smartctl >/dev/null 2>&1; then
-echo -e "\n${red}Error: smartctl not found (smartmontools).${reset}"
-echo -e "${yellow}Install it (sudo pacman -S smartmontools), then re-run the script.${reset}"
-echo -e "\n${red}Exiting script...${reset}"
-read -r
-exit 1
+# Report how long it has been since the last successful run.
+# Uses the newest Update-*.log timestamp as the reference.
+log_file=$(find "$HOME" -maxdepth 1 -type f -name 'Update-*.log' -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR==1 {print $2}')
+if [[ -f "$log_file" ]]; then
+  file_time=$(stat -c %Y "$log_file")
+  now_time=$(date +%s)
+  seconds_diff=$(( now_time - file_time ))
+  days=$(( seconds_diff / 86400 ))
+  hours=$(( (seconds_diff % 86400) / 3600 ))
+echo -e "${blue}Time since last update: ${orange}${days}${reset} days and ${orange}${hours}${reset} hours"
+else
+  echo -e "${red}No update logs found.${reset}"
 fi
+echo
+echo
 
-# Detect the physical disk behind /
+
+
+# Gate the run on basic NVMe SMART health.
+# Avoids performing upgrades when storage is already unhealthy.
+echo -e "\n${orange}Checking NVMe SMART health...${reset}"
 root_src="$(findmnt -n -o SOURCE / 2>/dev/null)"
-
-# btrfs may return: /dev/nvme0n1p2[/@] -> strip "[/@]" so smartctl gets a real device path
 root_src="${root_src%%[*}"
-
 [[ -n "$root_src" && "$root_src" == /dev/* ]] && root_src="$(realpath "$root_src" 2>/dev/null || echo "$root_src")"
-
 disk="$root_src"
 while true; do
 pk="$(lsblk -no PKNAME "$disk" 2>/dev/null | head -n 1)"
 [[ -z "$pk" ]] && break
 disk="/dev/$pk"
 done
-
 if [[ -z "$disk" || "$disk" != /dev/* ]]; then
 echo -e "\n${red}Error: could not detect OS disk device for /.${reset}"
 echo -e "\n${red}Exiting script...${reset}"
 read -r
 exit 1
 fi
-
-# Prefer NVMe namespace node (/dev/nvmeXnY) for SMART (avoid partition nodes)
 SMART_DEV="$disk"
 if [[ "$SMART_DEV" =~ ^/dev/nvme[0-9]+n[0-9]+p[0-9]+$ ]]; then
-SMART_DEV="${SMART_DEV%p*}"      # /dev/nvme0n1p2 -> /dev/nvme0n1
+SMART_DEV="${SMART_DEV%p*}"
 fi
-
 echo
 echo -e "Device: ${blue}${SMART_DEV}${reset}"
-
 while true; do
-
 out="$(sudo smartctl -a "$SMART_DEV" 2>/dev/null)"
 st=$?
-
 if (( st == 0 )); then
 break
 fi
-
 echo -e "\n${red}Error: smartctl failed on ${SMART_DEV}.${reset}"
-
 while true; do
 echo
 echo -ne "${yellow}(r)etry SMART check or (e)xit script: ${reset}"
 read -r choice
 echo
-
 case "${choice,,}" in
 r) break ;;
 e)
@@ -231,9 +369,7 @@ echo -e "${red}Please answer with (r)etry or (e)xit.${reset}"
 ;;
 esac
 done
-
 done
-
 crit="$(printf '%s\n' "$out" | grep -m1 -oP 'Critical Warning:\s*\K0x[0-9a-fA-F]+' || true)"
 temp="$(printf '%s\n' "$out" | grep -m1 -oP 'Temperature:\s*\K[0-9]+' || true)"
 spare="$(printf '%s\n' "$out" | grep -m1 -oP 'Available Spare:\s*\K[0-9]+' || true)"
@@ -241,7 +377,6 @@ thresh="$(printf '%s\n' "$out" | grep -m1 -oP 'Available Spare Threshold:\s*\K[0
 used="$(printf '%s\n' "$out" | grep -m1 -oP 'Percentage Used:\s*\K[0-9]+' || true)"
 media_err="$(printf '%s\n' "$out" | grep -m1 -oP 'Media and Data Integrity Errors:\s*\K[0-9]+' || true)"
 err_log="$(printf '%s\n' "$out" | grep -m1 -oP 'Error Information Log Entries:\s*\K[0-9]+' || true)"
-
 crit="${crit:-0x00}"
 temp="${temp:-NA}"
 spare="${spare:-NA}"
@@ -249,7 +384,29 @@ thresh="${thresh:-NA}"
 used="${used:-NA}"
 media_err="${media_err:-NA}"
 err_log="${err_log:-NA}"
-
+health_ok=true
+health_warn=false
+if [[ "$spare" != "NA" && "$thresh" != "NA" ]] && (( spare < thresh )); then
+health_ok=false
+fi
+if [[ "$crit" != "0x00" ]]; then
+health_warn=true
+fi
+if [[ "$media_err" != "NA" ]] && (( media_err > 0 )); then
+health_warn=true
+fi
+{
+  echo "SMART full stats:"
+  echo "Critical Warning: $crit"
+  echo "Temperature: $temp C"
+  echo "Available Spare: $spare%  Threshold: $thresh%"
+  echo "Percentage Used: $used%"
+  echo "Media/Data Integrity Errors: $media_err"
+  echo "Error Log Entries: $err_log"
+  echo
+} >> "$log_path"
+if [[ "$health_ok" == false ]]; then
+echo -e "\n${red}SMART health looks BAD (Available Spare below threshold).${reset}"
 echo
 echo -e "Critical Warning:${reset} ${orange}${crit}${reset}"
 echo -e "Temperature:${reset} ${orange}${temp}${reset} C"
@@ -257,24 +414,6 @@ echo -e "Available Spare:${reset} ${orange}${spare}${reset}%  Threshold:${reset}
 echo -e "Percentage Used:${reset} ${orange}${used}${reset}%"
 echo -e "Media/Data Integrity Errors:${reset} ${orange}${media_err}${reset}"
 echo -e "Error Log Entries:${reset} ${orange}${err_log}${reset}"
-
-health_ok=true
-health_warn=false
-
-if [[ "$crit" != "0x00" ]]; then
-health_warn=true
-fi
-
-if [[ "$spare" != "NA" && "$thresh" != "NA" ]] && (( spare < thresh )); then
-health_ok=false
-fi
-
-if [[ "$media_err" != "NA" ]] && (( media_err > 0 )); then
-health_warn=true
-fi
-
-if [[ "$health_ok" == false ]]; then
-echo -e "\n${red}SMART health looks BAD (Available Spare below threshold).${reset}"
 while true; do
 echo
 echo -ne "${yellow}(r)etry SMART check or (e)xit script: ${reset}"
@@ -292,9 +431,15 @@ echo -e "${red}Please answer with (r)etry or (e)xit.${reset}"
 esac
 done
 fi
-
 if [[ "$health_warn" == true ]]; then
 echo -e "\n${yellow}SMART reports warnings. Backups recommended.${reset}"
+echo
+echo -e "Critical Warning:${reset} ${orange}${crit}${reset}"
+echo -e "Temperature:${reset} ${orange}${temp}${reset} C"
+echo -e "Available Spare:${reset} ${orange}${spare}${reset}%  Threshold:${reset} ${orange}${thresh}${reset}%"
+echo -e "Percentage Used:${reset} ${orange}${used}${reset}%"
+echo -e "Media/Data Integrity Errors:${reset} ${orange}${media_err}${reset}"
+echo -e "Error Log Entries:${reset} ${orange}${err_log}${reset}"
 echo -ne "${yellow}Proceed anyway? (y)es or (e)xit script: ${reset}"
 read -r go
 echo
@@ -303,22 +448,10 @@ echo -e "${red}Exiting script...${reset}"
 exit 1
 fi
 else
-echo -e "\n${green}SMART health looks OK.${reset}"
+echo -e "\n${green}SMART OK (temp ${temp}C, used ${used}%)${reset}"
 fi
-
 echo -e "\n"
-
-# --- Snapper safety gate (run early) ---
 echo -e "\n${orange}Checking for btrfs snapshots...${reset}"
-
-if ! command -v snapper >/dev/null 2>&1; then
-echo -e "\n${red}Error: snapper not found.${reset}"
-echo -e "${yellow}Install/configure snapper first, then re-run the script.${reset}"
-echo -e "\n${red}Exiting script...${reset}"
-read -r
-exit 1
-fi
-
 if [[ ! -d "/.snapshots" ]]; then
 echo -e "\n${red}Error: /.snapshots not found.${reset}"
 echo -e "${yellow}Btrfs snapshots are not mounted/configured for root.${reset}"
@@ -327,35 +460,31 @@ read -r
 exit 1
 fi
 
-# Try to auto-pick the config whose subvolume is "/". Fallback to "root".
+
+
+# Btrfs snapshots handling
 SNAPPER_CONFIG="$(
 sudo snapper --csvout --separator '|' --no-headers list-configs --columns config,subvolume 2>/dev/null \
 | awk -F'|' '$2=="/"{print $1; exit}'
 )"
 SNAPPER_CONFIG="${SNAPPER_CONFIG:-root}"
-
 cutoff_epoch="$(date -d '7 days ago' +%s)"
 
+# Helper function: get_recent_snapshots_sorted.
 get_recent_snapshots_sorted() {
-
 local out
 while true; do
-
 out="$(sudo snapper -c "$SNAPPER_CONFIG" --csvout --separator '|' --no-headers list --columns number,date,description 2>/dev/null)"
 local status=$?
-
 if (( status == 0 )); then
 break
 fi
-
 echo -e "\n${red}Error: snapper list failed (config: ${SNAPPER_CONFIG}).${reset}"
-
 while true; do
 echo
 echo -ne "${yellow}(r)etry or (e)xit script: ${reset}"
 read -r choice
 echo
-
 case "${choice,,}" in
 r) break ;;
 e)
@@ -367,65 +496,44 @@ echo -e "${red}Please answer with (r)etry or (e)xit.${reset}"
 ;;
 esac
 done
-
 done
-
 printf '%s\n' "$out" \
 | awk -F'|' '$1 ~ /^[0-9]+$/ && $1 != "0" {print $1 "|" $2 "|" $3}' \
 | while IFS='|' read -r num sdate desc; do
-
 local snap_epoch
 snap_epoch="$(date -d "$sdate" +%s 2>/dev/null || echo 0)"
-
 if (( snap_epoch >= cutoff_epoch )); then
 printf '%s|%s|%s|%s\n' "$snap_epoch" "$num" "$sdate" "$desc"
 fi
-
 done \
 | sort -nr
 }
-
 mapfile -t recent_lines < <(get_recent_snapshots_sorted)
-
 if (( ${#recent_lines[@]} > 0 )); then
-
 echo -e "\n${green}Found Btrfs snapshot 7 days or newer, continuing...${reset}"
-
 for line in "${recent_lines[@]}"; do
 IFS='|' read -r epoch num sdate desc <<< "$line"
 echo -e "${reset}${num}${reset}  ${sdate}  ${desc}"
 done
-
 echo -e "\n\n"
-
 else
-
 echo -e "\n${yellow}No snapshots found from the last 7 days.${reset}"
-
-# --- Step 1: create snapshot (retry only this step) ---
 snapshot_desc="Update-$(date +%F_%H-%M-%S)"
 new_num=""
-
 while true; do
-
 echo -e "\n${cyan}Creating snapshot: ${orange}${snapshot_desc}${reset}"
-
 new_num="$(sudo snapper -c "$SNAPPER_CONFIG" create --description "$snapshot_desc" --print-number 2>/dev/null)"
 snap_status=$?
-
 if (( snap_status == 0 )) && [[ "$new_num" =~ ^[0-9]+$ ]]; then
 echo -e "\n${green}Snapshot created: #${new_num} ${orange}${snapshot_desc}${reset}"
 break
 fi
-
 echo -e "\n${red}Error: snapper snapshot creation failed.${reset}"
-
 while true; do
 echo
 echo -ne "${yellow}(r)etry snapshot or (e)xit script: ${reset}"
 read -r choice
 echo
-
 case "${choice,,}" in
 r) break ;;
 e)
@@ -437,28 +545,20 @@ echo -e "${red}Please answer with (r)etry or (e)xit.${reset}"
 ;;
 esac
 done
-
 done
-
-# --- Step 2: update grub (retry only this step; do not re-create snapshot) ---
 while true; do
-
 echo -e "\n${cyan}Updating GRUB config...${reset}"
-
 if sudo grub-mkconfig -o /boot/grub/grub.cfg; then
 echo -e "\n${green}GRUB updated successfully.${reset}"
 echo -e "\n\n"
 break
 fi
-
 echo -e "\n${red}Error: grub-mkconfig failed.${reset}"
-
 while true; do
 echo
 echo -ne "${yellow}(r)etry grub update or (e)xit script: ${reset}"
 read -r choice
 echo
-
 case "${choice,,}" in
 r) break ;;
 e)
@@ -470,48 +570,22 @@ echo -e "${red}Please answer with (r)etry or (e)xit.${reset}"
 ;;
 esac
 done
-
 done
-
 fi
 
-# Days and hours since last full update
-log_file=$(find "$HOME" -maxdepth 1 -type f -name 'Update-*.log' -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR==1 {print $2}')
 
-if [[ -f "$log_file" ]]; then
-  # Get modification time and current time in seconds
-  file_time=$(stat -c %Y "$log_file")
-  now_time=$(date +%s)
 
-  # Total difference in seconds
-  seconds_diff=$(( now_time - file_time ))
-
-  # Calculate days and hours
-  days=$(( seconds_diff / 86400 ))
-  hours=$(( (seconds_diff % 86400) / 3600 ))
-
-echo -e "${blue}Time since last update: ${orange}${days}${reset} days and ${orange}${hours}${reset} hours"
-else
-  echo -e "${red}No update logs found.${reset}"
-fi
-echo
-
-#Latest stable topic info (JSON, file-based, newest created)
+# Manjaro forum stats
 CATEGORY_JSON="/tmp/manjaro/category.json"
 TOPIC_JSON="/tmp/manjaro/topic.json"
-
-# Download category JSON (Discourse)
 if ! curl -fsSL -A 'Mozilla/5.0' \
   "https://forum.manjaro.org/c/announcements/stable-updates/12.json" \
   -o "$CATEGORY_JSON"; then
-
   FIRST_TOPIC_URL=""
   TOPIC_JSON_URL=""
   VOTERS=0
   NO_ISSUE_VOTES=0
-
 else
-  # Extract newest-created non-pinned topic -> build URL
   FIRST_TOPIC_URL="$(
     python3 - <<'PY' "$CATEGORY_JSON" 2>/dev/null
 import json,sys
@@ -523,149 +597,103 @@ for t in topics:
         break
 PY
   )"
-
   if [[ -n "$FIRST_TOPIC_URL" ]]; then
     TOPIC_JSON_URL="${FIRST_TOPIC_URL}.json"
-
-    # Download topic JSON
     if curl -fsSL -A 'Mozilla/5.0' "$TOPIC_JSON_URL" -o "$TOPIC_JSON"; then
-
-      # Extract voters + "no issue" votes from poll (search any post returned)
       read -r VOTERS NO_ISSUE_VOTES <<<"$(
         python3 - <<'PY' "$TOPIC_JSON" 2>/dev/null
 import json,sys
 d=json.load(open(sys.argv[1]))
 posts=d.get("post_stream",{}).get("posts",[])
-
 poll=None
 for p in posts:
     pls=p.get("polls") or []
     if pls:
         poll=pls[0]
         break
-
 if not poll:
     print("0 0"); raise SystemExit
-
 voters=int(poll.get("voters",0) or 0)
 no_issue=0
-
 for opt in poll.get("options",[]):
     txt=(opt.get("html","") or "").lower()
-    # match both "No issue" and "No issues"
     if "no issu" in txt or "smooth" in txt:
         no_issue=int(opt.get("votes",0) or 0)
         break
-
 print(voters, no_issue)
 PY
       )"
-
       VOTERS="${VOTERS:-0}"
       NO_ISSUE_VOTES="${NO_ISSUE_VOTES:-0}"
-
     else
       VOTERS=0
       NO_ISSUE_VOTES=0
     fi
-
   else
     TOPIC_JSON_URL=""
     VOTERS=0
     NO_ISSUE_VOTES=0
   fi
 fi
-
-# Sanity check to avoid division by zero (your original logic/echo preserved)
 if [[ -n "$VOTERS" && "$VOTERS" -ne 0 ]]; then
   NO_ISSUE_PERCENT=$(( (100 * NO_ISSUE_VOTES + VOTERS/2) / VOTERS ))
   PERCENT_TEXT="${NO_ISSUE_PERCENT}"
 else
-  NO_ISSUE_PERCENT=-1  # use sentinel for "N/A"
+  NO_ISSUE_PERCENT=-1
   PERCENT_TEXT="N/A"
 fi
-
 echo -e "No issue: ${orange}${PERCENT_TEXT}${reset}%  Total votes: ${VOTERS:-0}"
 echo
-
-
-
-# Packages count
+echo
+echo
 aur_count=$(pacman -Qm | wc -l)
 extensions_count=$(gext list | wc -l)
 flatpak_count=$(flatpak list --app --columns=application 2>/dev/null | wc -l)
-
 echo -e "${reset}Aur: ${orange}${aur_count}${reset}  Extensions: ${orange}${extensions_count}${reset}  Flatpaks: ${flatpak_count}"
-
 read total used avail <<< $(df / --block-size=1 | awk 'NR==2 {print $2, $3, $4}')
 percent=$(awk -v u="$used" -v t="$total" 'BEGIN { printf "%.1f", (u/t)*100 }')
 used_gb=$(awk -v u="$used" 'BEGIN { printf "%.1f", u/1e9 }')
 explicit_count=$(pacman -Qe | wc -l)
-
 echo -e "${reset}Disk used: ${orange}${used_gb}${reset}GB (${percent}% full)  Programs: ${explicit_count}"
-echo -e "\n\n"
 
-# Function to execute commands and check for errors
+
+
+# Run a command with consistent logging and error handling.
+# Shows status, captures failures, and preserves exit codes.
 run_command() {
-  # keep the original string BEFORE any shift (otherwise you print '' after shift)
   local pretty="$*"
-
   echo -e "\n\n\n${cyan}Running: ${pretty}${reset}"
-
-  # hard fail if called empty
   if (( $# == 0 )); then
     echo -e "${red}Error: run_command called with no arguments.${reset}"
     return 1
   fi
-
   local status=0
-  local cmd_str=""
-
-  if [[ "$1" == "sudo" && "$2" == "pacman" ]]; then
-    shift 2
-   cmd_str="$(printf '%q ' pacman "$@")"
-    # -e is IMPORTANT: makes script return the child exit code (otherwise false “success” possible)
-    sudo script -q -e /dev/null -c "$cmd_str"
-    status=$?
-
-  elif [[ "$1" == "yay" ]]; then
-    shift 1
-    cmd_str="$(printf '%q ' yay "$@")"
-    script -q -e /dev/null -c "$cmd_str"
-    status=$?
-
-  else
-    "$@"
-    status=$?
-  fi
-
+  "$@"
+  status=$?
   if (( status != 0 )); then
     echo -e "${red}Error: Command '${pretty}' failed with exit code ${status}${reset}"
     return 1
   fi
-
   echo -e "${green}Command '${pretty}' completed successfully.${reset}"
   return 0
 }
 
-# Lock-handling prompt function (correct + honest)
+
+
+# Helper function: prompt_for_db_lock_resolution.
 prompt_for_db_lock_resolution() {
   while [[ -f /var/lib/pacman/db.lck ]]; do
     echo > /dev/tty
     echo -ne "${yellow}Pacman database is locked. (r)etry  (d)elete lock  (e)xit:${reset} " > /dev/tty
     read -r choice < /dev/tty
     echo > /dev/tty
-
     case "${choice,,}" in
       r)
         echo -e "${cyan}Retrying in 5 seconds...${reset}" > /dev/tty
         sleep 5
         ;;
-
       d)
         echo -e "${cyan}Checking who holds the lock...${reset}" > /dev/tty
-
-        # If fuser reports a PID (exit 0), lock is in use -> DO NOT delete.
         if sudo fuser -v /var/lib/pacman/db.lck >/dev/tty 2>&1; then
           echo -e "${red}Lock appears to be in use. Not deleting.${reset}" > /dev/tty
           echo -e "${yellow}Close pamac/Octopi or kill the shown PID, then retry.${reset}" > /dev/tty
@@ -678,20 +706,16 @@ prompt_for_db_lock_resolution() {
           fi
         fi
         ;;
-
       e)
         echo -e "${red}Exiting due to pacman lock.${reset}" > /dev/tty
         exit 1
         ;;
-
       *)
         echo -e "${red}Invalid choice. Try again.${reset}" > /dev/tty
         ;;
     esac
   done
 }
-
-# Prompt if percentage low or low voter count
 if (( NO_ISSUE_PERCENT < 85 || VOTERS < 200 )); then
   echo -ne "${red}Low 'No issue' percentage or low Voters count. (y)es to open Manjaro topic or any other key to continue: ${reset}"
   read -r REPLY
@@ -700,8 +724,7 @@ if (( NO_ISSUE_PERCENT < 85 || VOTERS < 200 )); then
   fi
   echo -e "\n\n"
 fi
-
-# Proceed with update prompt
+echo -e "\n\n"
 echo -ne "${yellow}Proceed with the update? (n)o or any other key: ${reset}"
 read -rp "" update
 if [[ "${update,,}" = "n" ]]; then
@@ -709,36 +732,13 @@ if [[ "${update,,}" = "n" ]]; then
 fi
 
 
+
 echo -e "\n\n\n\n${purple}$(printf '%*s' 49 '' | tr ' ' '-') Mirrors refresh $(printf '%*s' 49 '' | tr ' ' '-')${reset}"
 
-# --- Simple pacman rescue: on error, wipe sync DBs and force full refresh ---
-pacman_rescue() {
-  local rescue_log
-  rescue_log=$(mktemp /tmp/manjaro/pacman_rescue.XXXXXX)
 
-  local had_pipefail=0
-  set -o | grep -q 'pipefail[[:space:]]*on' && had_pipefail=1
-  set -o pipefail
 
-  if ! run_command sudo pacman "$@" 2>&1 | tee "$rescue_log"; then
-    if grep -qiE 'invalid or corrupted package|failed to commit transaction|database' "$rescue_log"; then
-      echo
-      echo -e "${red}Pacman error detected; purging sync databases and forcing full refresh...${reset}"
-      sudo rm -f /var/lib/pacman/sync/*
-      run_command sudo pacman -Syyu --noconfirm
-    else
-      [[ $had_pipefail -eq 0 ]] && set +o pipefail
-      rm -f "$rescue_log"
-      return 1
-    fi
-  fi
-
-  [[ $had_pipefail -eq 0 ]] && set +o pipefail
-  rm -f "$rescue_log"
-}
-
-# Refresh mirrors
-
+# Refresh and validate mirror configuration for stable updates.
+# Rebuilds a sane mirrorlist and warns if the result is too small.
 refresh_mirrors=true
 MIRRORLIST="/etc/pacman.d/mirrorlist"
 if [[ -f "$MIRRORLIST" ]]; then
@@ -752,7 +752,6 @@ if [[ -f "$MIRRORLIST" ]]; then
     fi
   fi
 fi
-
 if [[ "$refresh_mirrors" == true ]]; then
 while true; do
   if run_command sudo pacman-mirrors --fasttrack 10 --api --protocols all --set-branch stable; then
@@ -760,7 +759,6 @@ while true; do
     mirror_count=$(grep -c '^Server *= *' "$MIRRORLIST")
     echo
     echo -e "${reset}Mirrors saved: ${orange}$mirror_count${reset}"
-
     if (( mirror_count >= 6 )); then
       break
     else
@@ -780,7 +778,6 @@ while true; do
     echo
     echo -e "${red}Failed to refresh mirrors.${reset}"
   fi
-
   while true; do
     echo
     echo -ne "${yellow}(r)etry Fasttrack  (u)se Global mirrors  (c)ontinue script  or (e)xit: ${reset}"
@@ -795,7 +792,6 @@ while true; do
           mirror_count=$(grep -c '^Server *= *' "$MIRRORLIST")
           echo
           echo -e "${reset}Mirrors saved: ${orange}$mirror_count${reset}"
-
           if (( mirror_count >= 6 )); then
             break 2  # done with mirror setup, exit both loops
           else
@@ -824,79 +820,63 @@ while true; do
   done
 done
 fi
-# Refresh mirrors
+
+
+
 ((++current_step)); show_progress $current_step $total_steps
-
 echo -e "\n\n\n\n${purple}$(printf '%*s' 48 '' | tr ' ' '-') Packages updates $(printf '%*s' 49 '' | tr ' ' '-')${reset}"
-
-
-# ---- Dry-run preview AFTER mirrors refresh (fixed) ----
-prompt_for_db_lock_resolution
-
 echo -e "\n\n\n"
+
+
+
+# Dry run to check imminent updates volume
 echo -e "${yellow}Checking real update size (dry run)...${reset}"
-
-# Refresh sync DBs (quiet)
+prompt_for_db_lock_resolution
 sudo pacman -Sy --noconfirm >/dev/null
-
-# List real repo upgrades
 mapfile -t repo_up < <(pacman -Qu 2>/dev/null)
-
+total_bytes=0
 if (( ${#repo_up[@]} == 0 )); then
   echo -e "Packages to update (repo): 0"
   echo -e "Total download size (repo): 0.00 MiB"
 else
   echo -e "Packages to update (repo): ${#repo_up[@]}"
   printf '%s\n' "${repo_up[@]}" | sed 's/^/  - /'
-
-  # Download size for repo upgrades only
   total_bytes="$(sudo pacman -Sup --print-format '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')"
   awk -v b="$total_bytes" 'BEGIN{printf "Total download size (repo): %.2f MiB\n", b/1024/1024}'
 fi
-
-echo
-echo -ne "${yellow}Proceed with the update? (n)o or any other key: ${reset}"
-read -rp "" update
-if [[ "${update,,}" = "n" ]]; then
-  exit
+threshold_bytes=$((300 * 1024 * 1024))
+if (( total_bytes >= threshold_bytes )); then
+  echo
+  echo -ne "${yellow}Proceed with the update? (n)o or any other key: ${reset}"
+  read -rp "" update
+  if [[ "${update,,}" = "n" ]]; then
+    exit
+  fi
 fi
-# ---- End dry-run preview ----
 
 
 
-# Perform updates
-
+# Helper function: replace_aur_with_repo.
 replace_aur_with_repo() {
 echo -e "\n\n\n"
 echo -e "${cyan}Checking for AUR packages that now exist in Manjaro repos...${reset}"
-
-# Permanent exclude list
 local exclude_file="$HOME/.aur_excluded_pkg"
 sudo -u "$USER" touch "$exclude_file"
-
-# Load excludes into a set (associative array)
 declare -A excluded=()
 while IFS= read -r line; do
-# skip blanks/comments
 [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
 excluded["$line"]=1
 done < "$exclude_file"
-
-# Define default suffixes for variant stripping
 local default_suffixes=(
 "-git" "-bin" "-vcs" "-aur" "-devel" "-nightly" "-wayland" "-stable" "-legacy"
 "-nox" "-gtk2" "-gtk3" "-gtk4" "-qt4" "-qt5" "-qt6" "-beta" "-alpha"
 )
 local suffixes=("${default_suffixes[@]}")
-
-# Load cached repo packages list
 if [[ ! -f /tmp/manjaro/repo_pkgs.txt ]]; then
 echo -e "${red}Repo package list file /tmp/manjaro/repo_pkgs.txt not found! Run pacman -Sl to generate it.${reset}"
 return 1
 fi
 mapfile -t repo_pkgs < "/tmp/manjaro/repo_pkgs.txt"
-
-# Get installed AUR packages (local foreign)
 mapfile -t aur_pkgs < <(pacman -Qm | awk '{print $1}' | sort)
 if (( ${#aur_pkgs[@]} == 0 )); then
 echo
@@ -904,29 +884,26 @@ echo -e "${orange}No AUR packages detected.${green} Nothing to check.${reset}"
 return 0
 fi
 
-# Helper: append package to exclude file once (idempotent)
+# Helper function: add_to_exclude_file.
 add_to_exclude_file() {
 local pkg="$1"
-# Append only if exact line does not already exist (no duplicates)
 if ! grep -qxF "$pkg" "$exclude_file"; then
 printf '%s\n' "$pkg" >> "$exclude_file"
 fi
 excluded["$pkg"]=1
 }
 
-# Multi-match fuzzy search function + new exclude option
+# Helper function: fuzzy_match.
 fuzzy_match() {
 local aur_pkg="$1" # original AUR name
 local aur_base="$2" # stripped base used for searching
 local aur_base_esc
 aur_base_esc=$(printf '%s' "$aur_base" | sed -e 's/[][(){}.^$*+?|\\]/\\&/g')
 mapfile -t matches < <(printf '%s\n' "${repo_pkgs[@]}" | grep -iE "(^|[-_])${aur_base_esc}($|[-_])")
-
 if (( ${#matches[@]} == 0 )); then
 echo ""
 return
 fi
-
 {
 echo
 echo -e "${yellow}Fuzzy matches for '$aur_base' (from AUR '$aur_pkg'):${reset}"
@@ -938,7 +915,6 @@ done
 echo " [0] Skip"
 echo " [x] Exclude '$aur_pkg' permanently"
 } > /dev/tty
-
 local choice
 while true; do
 echo -ne "${cyan}Choose number / 0 / x: ${reset}" > /dev/tty
@@ -949,7 +925,6 @@ elif [[ "${choice,,}" == "x" ]]; then
 break
 fi
 done
-
 if [[ "${choice,,}" == "x" ]]; then
 add_to_exclude_file "$aur_pkg"
 echo ""
@@ -960,18 +935,15 @@ echo "${matches[choice-1]}"
 fi
 }
 
-# Find AUR replacements
+# Helper function: find_aur_replacements.
 find_aur_replacements() {
 local aur_pkgs=("$@")
-to_replace=() # global
-
+to_replace=()
 for aur in "${aur_pkgs[@]}"; do
-# NEW: skip excluded packages early
 if [[ -n "${excluded[$aur]:-}" ]]; then
 echo -e "Excluded from replacement (persistent):${blue} ${aur}${reset}"
 continue
 fi
-
 local base="$aur"
 for suf in "${suffixes[@]}"; do
 if [[ "$aur" == *"$suf" ]]; then
@@ -979,22 +951,16 @@ base="${aur%"$suf"}"
 break
 fi
 done
-
 if [[ " ${repo_pkgs[*]} " == *" $base "* ]]; then
 to_replace+=("$aur|$base")
 else
-# interactive fuzzy match with exclude option
 local matched_pkg
 matched_pkg=$(fuzzy_match "$aur" "$base")
 [[ -n "$matched_pkg" ]] && to_replace+=("$aur|$matched_pkg") || true
 fi
 done
 }
-
-# Run replacement finder
 find_aur_replacements "${aur_pkgs[@]}"
-
-# Filter valid entries only
 local valid_replace=()
 for entry in "${to_replace[@]}"; do
 local aur="${entry%%|*}"
@@ -1003,13 +969,10 @@ if [[ -n "$aur" && -n "$base" ]]; then
 valid_replace+=("$entry")
 fi
 done
-
 if (( ${#valid_replace[@]} == 0 )); then
 echo -e "${orange}No AUR packages found in official repos (after exclusions).${cyan} Nothing to replace.${reset}"
 return 0
 fi
-
-# Summary of replacements
 echo
 echo -e "${yellow}The following AUR packages are now in the official repos:${reset}"
 printf "%-30s %-30s\n" "AUR Package" "Repo Package"
@@ -1019,33 +982,27 @@ local aur="${entry%%|*}"
 local base="${entry##*|}"
 printf "%-30s %-30s\n" "$aur" "$base"
 done
-
-# Confirm to proceed
 echo
 echo -ne "${cyan}Proceed with replacing them? (y)es or any other key to skip: ${reset}"
 read -r choice < /dev/tty
 if [[ "$choice" =~ ^[Yy]$ ]]; then
-# Perform replacements
 for entry in "${valid_replace[@]}"; do
 local aur="${entry%%|*}"
 local base="${entry##*|}"
-
 echo -e "${cyan}Removing AUR package: $aur...${reset}"
 if ! run_command yay -Rns --noconfirm "$aur"; then
 echo -e "${red}Failed to remove $aur. Skipping this package.${reset}"
 continue
 fi
-
 echo -e "${cyan}Installing repo package: $base...${reset}"
-if ! pacman_rescue -S --noconfirm "$base"; then
+prompt_for_db_lock_resolution
+if ! run_command sudo pacman -S --noconfirm "$base"; then
 echo -e "${red}Failed to install $base. Attempting to reinstall $aur...${reset}"
 run_command yay -S --noconfirm "$aur"
 continue
 fi
-
 echo -e "${green}Replaced $aur with $base successfully.${reset}"
 done
-
 echo
 echo -e "${green}All replacements completed.${reset}"
 else
@@ -1054,51 +1011,41 @@ echo -e "${red}Replacement operation skipped by user.${reset}"
 fi
 }
 
+
+
+# Helper function: replace_flatpaks_with_repo.
 replace_flatpaks_with_repo() {
 echo -e "\n\n\n"
 echo -e "${cyan}Checking for Flatpak apps that also exist as Manjaro repo packages...${reset}"
-
-# Permanent exclude list
 local exclude_file="$HOME/.flatpak_excluded_app"
 touch "$exclude_file"
-
-# Load excludes into a set (associative array)
 declare -A excluded=()
 while IFS= read -r line; do
-# skip blanks/comments
 [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
 excluded["$line"]=1
 done < "$exclude_file"
-
-# Define default suffixes for variant stripping (applied to derived base name)
 local default_suffixes=(
 "-git" "-bin" "-vcs" "-aur" "-devel" "-nightly" "-wayland" "-stable" "-legacy"
 "-nox" "-gtk2" "-gtk3" "-gtk4" "-qt4" "-qt5" "-qt6" "-beta" "-alpha"
 )
 local suffixes=("${default_suffixes[@]}")
-
-# Load cached repo packages list
 if [[ ! -f /tmp/manjaro/repo_pkgs.txt ]]; then
 echo -e "${red}Repo package list file /tmp/manjaro/repo_pkgs.txt not found! Run pacman -Sl to generate it.${reset}"
 return 1
 fi
 mapfile -t repo_pkgs < "/tmp/manjaro/repo_pkgs.txt"
-
-# Get installed Flatpaks with origin + installation (user/system)
-# Format: appid|origin|install
 mapfile -t flatpak_rows < <(
   flatpak list --app --columns=application,origin,installation 2>/dev/null \
   | awk 'NF{print $1 "|" $2 "|" $3}' \
   | sort -u
 )
-
 if (( ${#flatpak_rows[@]} == 0 )); then
 echo
 echo -e "${orange}No Flatpaks detected.${green} Nothing to check.${reset}"
 return 0
 fi
 
-# Helper: append appid to exclude file once (idempotent)
+# Helper function: add_to_exclude_file.
 add_to_exclude_file() {
 local appid="$1"
 if ! grep -qxF "$appid" "$exclude_file"; then
@@ -1107,24 +1054,17 @@ fi
 excluded["$appid"]=1
 }
 
-# Derive a repo-ish base name from Flatpak ID
-# Examples:
-#   org.mozilla.firefox        -> firefox
-#   com.spotify.Client         -> spotify   (Client is too generic)
+# Helper function: flatpak_base_from_appid.
 flatpak_base_from_appid() {
 local appid="$1"
 local last="${appid##*.}"
 local base="$last"
-
-# If the last segment is generic, use the previous one
 case "$last" in
 Client|client|Desktop|desktop|App|app)
 local prev="${appid%.*}"
 base="${prev##*.}"
 ;;
 esac
-
-# Strip known suffix variants from the derived base
 local suf
 for suf in "${suffixes[@]}"; do
 if [[ "$base" == *"$suf" ]]; then
@@ -1132,24 +1072,20 @@ base="${base%"$suf"}"
 break
 fi
 done
-
 printf '%s' "$base"
 }
 
-# Multi-match fuzzy search + exclude option (searches repo_pkgs)
+# Helper function: fuzzy_match.
 fuzzy_match() {
 local appid="$1"     # original flatpak id
 local base="$2"      # derived base used for searching
 local base_esc
 base_esc=$(printf '%s' "$base" | sed -e 's/[][(){}.^$*+?|\\]/\\&/g')
-
 mapfile -t matches < <(printf '%s\n' "${repo_pkgs[@]}" | grep -iE "(^|[-_])${base_esc}($|[-_])")
-
 if (( ${#matches[@]} == 0 )); then
 echo ""
 return
 fi
-
 {
 echo
 echo -e "${yellow}Fuzzy matches for '$base' (from Flatpak '$appid'):${reset}"
@@ -1161,7 +1097,6 @@ done
 echo " [0] Skip"
 echo " [x] Exclude '$appid' permanently"
 } > /dev/tty
-
 local choice
 while true; do
 echo -ne "${cyan}Choose number / 0 / x: ${reset}" > /dev/tty
@@ -1172,7 +1107,6 @@ elif [[ "${choice,,}" == "x" ]]; then
 break
 fi
 done
-
 if [[ "${choice,,}" == "x" ]]; then
 add_to_exclude_file "$appid"
 echo ""
@@ -1183,40 +1117,29 @@ echo "${matches[choice-1]}"
 fi
 }
 
-# Find Flatpak -> repo replacements
+# Helper function: find_flatpak_replacements.
 find_flatpak_replacements() {
 local rows=("$@")
-to_replace=() # global
-
+to_replace=()
 local row appid origin install base matched_pkg
 for row in "${rows[@]}"; do
 appid="${row%%|*}"
 origin="${row#*|}"; origin="${origin%%|*}"
 install="${row##*|}"
-
-# Skip excluded apps early
 if [[ -n "${excluded[$appid]:-}" ]]; then
 echo -e "Excluded from replacement (persistent):${blue} ${appid}${reset}"
 continue
 fi
-
 base="$(flatpak_base_from_appid "$appid")"
-
-# Exact match first
 if [[ " ${repo_pkgs[*]} " == *" $base "* ]]; then
 to_replace+=("$appid|$origin|$install|$base")
 else
-# interactive fuzzy match with exclude option
 matched_pkg="$(fuzzy_match "$appid" "$base")"
 [[ -n "$matched_pkg" ]] && to_replace+=("$appid|$origin|$install|$matched_pkg") || true
 fi
 done
 }
-
-# Run replacement finder
 find_flatpak_replacements "${flatpak_rows[@]}"
-
-# Filter valid entries only
 local valid_replace=()
 local entry appid origin install repo_pkg
 for entry in "${to_replace[@]}"; do
@@ -1228,13 +1151,10 @@ if [[ -n "$appid" && -n "$repo_pkg" ]]; then
 valid_replace+=("$entry")
 fi
 done
-
 if (( ${#valid_replace[@]} == 0 )); then
 echo -e "${orange}No Flatpaks found with matching Manjaro repo packages (after exclusions).${cyan} Nothing to replace.${reset}"
 return 0
 fi
-
-# Summary of replacements
 echo
 echo -e "${yellow}The following Flatpaks appear to exist as Manjaro repo packages:${reset}"
 printf "%-45s %-8s %-20s %-30s\n" "Flatpak AppID" "Scope" "Origin" "Repo Package"
@@ -1246,21 +1166,16 @@ install="$(cut -d'|' -f3 <<<"$entry")"
 repo_pkg="$(cut -d'|' -f4- <<<"$entry")"
 printf "%-45s %-8s %-20s %-30s\n" "$appid" "$install" "${origin:-NA}" "$repo_pkg"
 done
-
-# Confirm to proceed
 echo
 echo -ne "${cyan}Proceed with replacing them? (y)es or any other key to skip: ${reset}"
 read -r choice < /dev/tty
-
 if [[ "$choice" =~ ^[Yy]$ ]]; then
 for entry in "${valid_replace[@]}"; do
 appid="$(cut -d'|' -f1 <<<"$entry")"
 origin="$(cut -d'|' -f2 <<<"$entry")"
 install="$(cut -d'|' -f3 <<<"$entry")"
 repo_pkg="$(cut -d'|' -f4- <<<"$entry")"
-
 echo -e "${cyan}Removing Flatpak app: $appid...${reset}"
-
 if [[ "$install" == "user" ]]; then
 if ! run_command flatpak uninstall -y --user "$appid"; then
 echo -e "${red}Failed to remove Flatpak (user): $appid. Skipping this app.${reset}"
@@ -1272,12 +1187,10 @@ echo -e "${red}Failed to remove Flatpak (system): $appid. Skipping this app.${re
 continue
 fi
 fi
-
 echo -e "${cyan}Installing repo package: $repo_pkg...${reset}"
-if ! pacman_rescue -S --noconfirm "$repo_pkg"; then
+prompt_for_db_lock_resolution
+if ! run_command sudo pacman -S --noconfirm "$repo_pkg"; then
 echo -e "${red}Failed to install $repo_pkg. Attempting to reinstall Flatpak $appid...${reset}"
-
-# Best-effort reinstall if origin is known
 if [[ -n "$origin" && "$origin" != "NA" ]]; then
 if [[ "$install" == "user" ]]; then
 run_command flatpak install -y --user "$origin" "$appid"
@@ -1287,13 +1200,10 @@ fi
 else
 echo -e "${yellow}Flatpak origin unknown for $appid; reinstall skipped.${reset}"
 fi
-
 continue
 fi
-
 echo -e "${green}Replaced Flatpak $appid with repo package $repo_pkg successfully.${reset}"
 done
-
 echo
 echo -e "${green}All Flatpak replacements completed.${reset}"
 else
@@ -1302,205 +1212,202 @@ echo -e "${red}Replacement operation skipped by user.${reset}"
 fi
 }
 
+
+
+# Orchestrate the full update flow across pacman, AUR, and Flatpak.
 perform_updates() {
   echo
   prompt_for_db_lock_resolution
 
-  # Default flags (global on purpose; your outer loop reads them)
-  pacman_failed=true
-  yay_failed=true
-
-  # Loop pacman + PGP handling until:
-  # - pacman succeeds, OR
-  # - pacman fails with no PGP signature issue (then we return and let outer retry prompt handle it)
+  # ---- Pacman repo update loop (hard gate) ----
   while true; do
     local pacman_tmp_log="/tmp/manjaro/pacman_attempt.log"
     : > "$pacman_tmp_log"
 
-    # --- CRITICAL FIX: pipeline must reflect pacman_rescue exit, not tee exit ---
     local had_pipefail=0
     set -o | grep -q 'pipefail[[:space:]]*on' && had_pipefail=1
     set -o pipefail
 
-    if pacman_rescue -Syyu --noconfirm 2>&1 | tee -a "$pacman_tmp_log"; then
-      pacman_failed=false
-    else
-      pacman_failed=true
+    local pacman_log="/var/log/pacman.log"
+    local log_start
+    log_start=$(wc -l < "$pacman_log" 2>/dev/null || echo 0)
+
+    echo -e "\n\n\n${cyan}Running: sudo pacman -Syyu --noconfirm${reset}"
+    sudo pacman -Syyu --noconfirm
+    local status=$?
+    if (( status == 0 )); then
+  echo -e "${green}Command 'sudo pacman -Syyu --noconfirm' completed successfully.${reset}"
+else
+  echo -e "${red}Command 'sudo pacman -Syyu --noconfirm' failed with exit code ${status}.${reset}"
+fi
+
+    [[ -r "$pacman_log" ]] || : > "$pacman_tmp_log"
+    tail -n +"$((log_start + 1))" "$pacman_log" > "$pacman_tmp_log" 2>/dev/null
+
+    if (( status == 0 )); then
+      (( had_pipefail == 0 )) && set +o pipefail
+      break
     fi
 
     (( had_pipefail == 0 )) && set +o pipefail
-    # --- end fix ---
 
-    # If signature errors occurred, reset keyring and retry pacman inside this function
-    if grep -qiE 'signature.*(could not be verified|invalid|error|unknown|revoked|failed)' "$pacman_tmp_log"; then
+    # ---- Failure classification ----
+    if grep -qiE '(signature.*(could not be verified|invalid|unknown|revoked|failed)|invalid.*signature|failed to verify signature|keyring|gpgme|gpg:|public key|unknown trust|marginal trust|trust database|expired key|revoked key)' "$pacman_tmp_log"; then
       echo
-      echo -e "${red}PGP signature errors detected in pacman output.${reset}"
+      echo -e "${red}PGP / signature error detected.${reset}"
       echo
-      echo -ne "${yellow}Press any key to reset keyring and retry pacman update...${reset}"
-      read -r -n 1
+      echo "Choose recovery action:"
+      echo "  [r] Refresh keyring (non-destructive)"
+      echo "  [n] Nuke keyring and rebuild"
+      echo "  [e] Exit"
+      read -rp "> " ans
+      case "${ans,,}" in
+        r)
+          echo -e "${cyan}Refreshing keyring...${reset}"
+          sudo pacman -Sy --noconfirm archlinux-keyring manjaro-keyring || true
+          sudo pacman-key --refresh-keys || true
+          continue
+          ;;
+        n)
+          echo -e "${yellow}Nuking keyring and rebuilding...${reset}"
+          sudo rm -rf /etc/pacman.d/gnupg
+          sudo pacman-key --init
+          sudo pacman-key --populate archlinux manjaro
+          continue
+          ;;
+        e)
+          echo -e "${red}Aborting.${reset}"
+          return 1
+          ;;
+        *)
+          echo -e "${red}Invalid choice. Aborting.${reset}"
+          return 1
+          ;;
+      esac
+    else
       echo
-
-      sudo rm -rf /etc/pacman.d/gnupg
-      sudo pacman-key --init
-      sudo pacman-key --populate archlinux manjaro
-
-      echo -e "${cyan}Retrying pacman update after keyring reset...${reset}"
-      continue
+      echo -e "${red}Pacman failed (non-PGP error).${reset}"
+      echo "Choose action:"
+      echo "  [r] Retry"
+      echo "  [e] Exit"
+      read -rp "> " ans
+      case "${ans,,}" in
+        r) continue ;;
+        e) return 1 ;;
+        *) echo -e "${red}Invalid choice. Exiting.${reset}"; return 1 ;;
+      esac
     fi
-
-    # No signature errors. If pacman failed for other reasons, stop here.
-    if [[ "$pacman_failed" == true ]]; then
-      echo
-      echo -e "${red}Pacman update failed (non-PGP). Not proceeding to AUR/yay steps.${reset}"
-      return 1
-    fi
-
-    break
   done
 
-  # Ensure repo list exists for any function that needs it
+  # ---- Repo package list (warning only) ----
   mkdir -p /tmp/manjaro
   if ! pacman -Slq | sort -u > /tmp/manjaro/repo_pkgs.txt; then
     echo
-    echo -e "${red}Failed to generate /tmp/manjaro/repo_pkgs.txt. Not proceeding.${reset}"
-    pacman_failed=true
-    return 1
+    echo -e "${yellow}WARNING: Failed to generate repo package list.${reset}"
   fi
 
-  # Replace AUR packages that now exist in official repos
+  # ---- Replace AUR with repo ----
   replace_aur_with_repo
 
+  # ---- Yay update (best effort) ----
   prompt_for_db_lock_resolution
-
-  if ! run_command yay -Syu --devel --timeupdate --noconfirm --cleanafter --editmenu=false --combinedupgrade ; then
+  while true; do
+    if run_command yay -Syu --devel --timeupdate --noconfirm --cleanafter --editmenu=false --combinedupgrade; then
+      break
+    fi
     echo
     echo -e "${red}Yay update failed.${reset}"
-    yay_failed=true
-    return 1
-  else
-    yay_failed=false
-  fi
+    echo "Choose action:"
+    echo "  [r] Retry yay"
+    echo "  [c] Continue without yay"
+    read -rp "> " ans
+    case "${ans,,}" in
+      r) continue ;;
+      c) break ;;
+      *) break ;;
+    esac
+  done
 
   return 0
 }
 
+
+
+# Helper function: rebuild_aur_if_needed.
 rebuild_aur_if_needed() {
   echo -e "\n\n"
   echo -e "${cyan}Checking for packages that need rebuild (rebuild-detector)...${reset}"
-
-  if ! command -v checkrebuild >/dev/null 2>&1; then
-    echo -e "${yellow}rebuild-detector not installed; skipping rebuild check.${reset}"
-    echo -e "${yellow}Install: sudo pacman -S rebuild-detector${reset}"
-    return 0
-  fi
-
-  # checkrebuild output format is typically: "<repo>\t<pkgname>"
-  # If nothing needs rebuild, it prints nothing.
-  mapfile -t need_rebuild < <(checkrebuild | awk 'NF{print $NF}' | sort -u)
-
+  mapfile -t need_rebuild < <(checkrebuild 2>/dev/null | awk '$1=="foreign"{print $2}' | sort -u)
   if (( ${#need_rebuild[@]} == 0 )); then
     echo -e "${green}No rebuilds needed.${reset}"
     return 0
   fi
-
-  # Build a fast lookup table of installed AUR packages
     local -A is_aur=()
   while read -r p _; do
     [[ -n "$p" ]] && is_aur["$p"]=1
   done < <(pacman -Qm)
-
-  # Filter rebuild list -> only AUR packages you actually have installed
   local -a aur_to_rebuild=()
   for p in "${need_rebuild[@]}"; do
     if [[ -n "${is_aur[$p]:-}" ]]; then
       aur_to_rebuild+=("$p")
     fi
   done
-
   if (( ${#aur_to_rebuild[@]} == 0 )); then
     echo -e "${yellow}Rebuild-detector flagged packages, but none are installed AUR packages. Skipping yay rebuild.${reset}"
     echo -e "${blue}Flagged:${reset} ${need_rebuild[*]}"
     return 0
   fi
-
   echo -e "${orange}AUR packages to rebuild:${reset} ${aur_to_rebuild[*]}"
-
-  # Force rebuild (yay rebuild flags have been historically messy across versions,
-  # but --rebuildtree is the intended approach; yay will still reinstall/build.)
   if ! run_command yay -S --noconfirm --rebuild --rebuildtree --cleanafter --editmenu=false "${aur_to_rebuild[@]}"; then
     echo
     echo -e "${red}AUR rebuild step failed.${reset}"
     return 1
   fi
-
   echo -e "${green}AUR rebuild step completed.${reset}"
   return 0
 }
-
-
-# Run updates first time
-perform_updates
-
-# Retry loop if either failed
-while [[ "$pacman_failed" == true || "$yay_failed" == true ]]; do
-  echo
-  echo -ne "${red}Pacman and or Yay failed (r)etry  (e)xit: ${reset} "
-  read -rp "" choice
-  case "$choice" in
-    [Rr]* )
-      echo
-      echo -e "${cyan}Retrying updates...${reset}"
-      perform_updates
-      ;;
-    [Ee]* )
-      echo -e "${red}Exiting script...${reset}"
-      exit 1
-      ;;
-    * )
-      echo
-      echo -e "${red}Please answer with (r)etry or (e)xit.${reset}"
-      ;;
-  esac
-done
-# Perform updates
-
-
+# ---- Call site: hard gate updates, then rebuild ----
+if ! perform_updates; then
+  echo -e "${red}Update stage failed. Exiting.${reset}"
+  exit 1
+fi
 rebuild_aur_if_needed || echo -e "${yellow}Rebuild skipped/failed.${reset}"
 
 
-((++current_step)); show_progress $current_step $total_steps
 
+((++current_step)); show_progress $current_step $total_steps
 echo -e "\n\n\n\n${purple}$(printf '%*s' 43 '' | tr ' ' '-') Extensions-Flatpaks updates $(printf '%*s' 43 '' | tr ' ' '-')${reset}"
 
-# User extensions updates
+
+
+# Extensions updates
 if ! run_command gext update -y; then
   echo
   echo -e "${red}User extensions updates failed, continuing...${reset}"
 fi
-
-# Replace Flatpaks with repo packages (before Flatpak updates)
 replace_flatpaks_with_repo
-
-# Flatpak updates sudo
 if ! run_command sudo flatpak update -y; then
   echo
   echo -e "${red}Flatpak update (sudo) failed, continuing...${reset}"
 fi
-
-# Flatpak updates user
 if ! run_command flatpak update -y; then
   echo
   echo -e "${red}Flatpak update (user) failed, continuing...${reset}"
 fi
-((++current_step)); show_progress $current_step $total_steps
 
+
+
+((++current_step)); show_progress $current_step $total_steps
 echo -e "\n\n\n\n${purple}$(printf '%*s' 49 '' | tr ' ' '-') Cleanup-Repairs $(printf '%*s' 49 '' | tr ' ' '-')${reset}"
 echo -e "\n\n\n"
 
-# Remove orphaned packages (auto-confirm)
+
+
+# Pacman  orphaned packages
 echo -e "${cyan}Checking for orphaned packages...${reset}"
 mapfile -t orphaned_packages < <(sudo pacman -Qtdq)
 if [ ${#orphaned_packages[@]} -ne 0 ]; then
+  prompt_for_db_lock_resolution
   if sudo pacman -Rns --noconfirm "${orphaned_packages[@]}"; then
     echo
     echo -e "${green}Orphaned packages removed.${reset}"
@@ -1512,28 +1419,24 @@ else
   echo
   echo -e "${cyan}No orphaned packages found.${reset}"
 fi
-
-# Clean pacman package cache (auto-confirm)
+prompt_for_db_lock_resolution
 if ! run_command bash -c "yes | sudo pacman -Scc"; then
   echo
   echo -e "${red}Failed to clean package cache with pacman -Scc, trying manual cache deletion...${reset}"
   run_command sudo rm -rf /var/cache/pacman/pkg/*
 fi
 
-# Flatpak clean orphaned components
+
+
+# Flatpak cleanup
 if ! run_command flatpak uninstall --unused -y; then
   echo
   echo -e "${red}Flatpak clean orphaned components failed, continuing...${reset}"
 fi
 echo -e "\n\n\n"
-
-# Remove unowned Flatpak app data (Flatpak-native)
-# NOTE: "--delete-data" without a REF removes all unowned app data.
 echo -e "${cyan}Running: flatpak uninstall --delete-data -y${reset}\n"
-
 flatpak uninstall --delete-data -y
 status=$?
-
 if (( status == 0 )); then
 echo -e "${green}Command 'flatpak uninstall --delete-data -y' completed successfully.${reset}"
 else
@@ -1543,8 +1446,6 @@ echo
 echo -e "${red}Flatpak unowned app data cleanup failed, continuing...${reset}"
 fi
 echo -e "\n\n\n"
-
-# Remove leftover Flatpak app data for uninstalled apps
 echo -e "${cyan}Checking for leftover Flatpak app data...${reset}"
 mapfile -t leftover_apps < <(comm -23 <(ls ~/.var/app | sort) <(flatpak list --app --columns=application | sort))
 if [ ${#leftover_apps[@]} -ne 0 ]; then
@@ -1560,18 +1461,9 @@ else
   echo -e "${cyan}No leftover Flatpak app data found.${reset}"
 fi
 echo -e "\n\n\n"
-
-# --- Extra Flatpak hygiene: prune stale exports + overrides (user + system) ---
-
-# Clean Flatpak exports (user) - fixes ghost desktop entries/icons
-# --- Flatpak exports hygiene (SAFE): remove only BROKEN export symlinks ---
-# This fixes "ghost" entries without deleting real launchers/icons.
-
 echo -e "${cyan}Checking Flatpak exports (user) for broken symlinks...${reset}"
-
 if [[ -d "$HOME/.local/share/flatpak/exports" ]]; then
   mapfile -t broken_user < <(find "$HOME/.local/share/flatpak/exports" -xtype l 2>/dev/null)
-
   if (( ${#broken_user[@]} > 0 )); then
     echo
     echo -e "${yellow}Broken user export links found:${reset}"
@@ -1592,14 +1484,9 @@ else
   echo -e "${cyan}No Flatpak exports directory (user) found.${reset}"
 fi
 echo -e "\n\n\n"
-
-
 echo -e "${cyan}Checking Flatpak exports (system) for broken symlinks...${reset}"
-
 if sudo test -d /var/lib/flatpak/exports; then
-  # Collect broken system links (if any)
   mapfile -t broken_sys < <(sudo find /var/lib/flatpak/exports -xtype l 2>/dev/null)
-
   if (( ${#broken_sys[@]} > 0 )); then
     echo
     echo -e "${yellow}Broken system export links found:${reset}"
@@ -1620,8 +1507,6 @@ else
   echo -e "${cyan}No Flatpak exports directory (system) found.${reset}"
 fi
 echo -e "\n\n\n"
-
-# Remove orphaned Flatpak overrides (user)
 echo -e "${cyan}Checking for orphaned Flatpak overrides (user)...${reset}"
 if [[ -d "$HOME/.local/share/flatpak/overrides" ]]; then
   mapfile -t orphan_overrides_user < <(
@@ -1630,7 +1515,6 @@ if [[ -d "$HOME/.local/share/flatpak/overrides" ]]; then
         flatpak info "$appid" >/dev/null 2>&1 || echo "$appid"
       done
   )
-
   if (( ${#orphan_overrides_user[@]} > 0 )); then
     echo
     echo -e "${yellow}Orphaned user overrides:${reset}"
@@ -1651,8 +1535,6 @@ else
   echo -e "${cyan}No user overrides directory found.${reset}"
 fi
 echo -e "\n\n\n"
-
-# Remove orphaned Flatpak overrides (system)
 echo -e "${cyan}Checking for orphaned Flatpak overrides (system)...${reset}"
 if [[ -d "/var/lib/flatpak/overrides" ]]; then
   mapfile -t orphan_overrides_sys < <(
@@ -1661,7 +1543,6 @@ if [[ -d "/var/lib/flatpak/overrides" ]]; then
         sudo flatpak info "$appid" >/dev/null 2>&1 || echo "$appid"
       done
   )
-
   if (( ${#orphan_overrides_sys[@]} > 0 )); then
     echo
     echo -e "${yellow}Orphaned system overrides:${reset}"
@@ -1682,15 +1563,14 @@ else
   echo -e "${cyan}No system overrides directory found.${reset}"
 fi
 echo -e "\n\n\n"
-
-# --- Flatpak remotes hygiene (interactive) ---
-
 echo -e "${cyan}Checking Flatpak remotes for unused entries...${reset}"
 echo
+
+
+
+# Helper function: cleanup_flatpak_remotes.
 cleanup_flatpak_remotes() {
-
 local scope="$1"   # "user" or "system"
-
 local list_cmd remote_del_cmd
 if [[ "$scope" == "user" ]]; then
 list_cmd=(flatpak --user)
@@ -1699,20 +1579,16 @@ else
 list_cmd=(sudo flatpak --system)
 remote_del_cmd=(sudo flatpak --system remote-delete --force)
 fi
-
 mapfile -t all_remotes < <("${list_cmd[@]}" remote-list --columns=name 2>/dev/null | sort -u)
 mapfile -t used_origins < <("${list_cmd[@]}" list --app --columns=origin 2>/dev/null | sort -u)
-
 if (( ${#all_remotes[@]} == 0 )); then
 echo -e "${cyan}No ${scope} Flatpak remotes found.${reset}"
 return 0
 fi
-
 declare -A used=()
 for o in "${used_origins[@]}"; do
 [[ -n "$o" ]] && used["$o"]=1
 done
-
 unused=()
 for r in "${all_remotes[@]}"; do
 [[ -n "$r" ]] || continue
@@ -1720,48 +1596,41 @@ if [[ -z "${used[$r]:-}" ]]; then
 unused+=("$r")
 fi
 done
-
 if (( ${#unused[@]} == 0 )); then
 echo -e "${cyan}No unused ${scope} Flatpak remotes detected.${reset}"
 return 0
 fi
-
 echo
 echo -e "${yellow}Unused ${scope} Flatpak remotes:${reset}"
 printf '%s\n' "${unused[@]}"
-
 echo
 echo -ne "${yellow}Remove these remotes? (y)es or any other key to skip: ${reset}"
 read -r ans
 echo
-
 if [[ "${ans,,}" != "y" ]]; then
 echo -e "${cyan}Skipping ${scope} remotes cleanup.${reset}"
 return 0
 fi
-
 for r in "${unused[@]}"; do
 echo -e "${cyan}Removing ${scope} remote: ${orange}${r}${reset}"
 if ! "${remote_del_cmd[@]}" "$r"; then
 echo -e "${red}Failed to remove remote: ${r}${reset}"
 fi
 done
-
 echo -e "${green}${scope} remotes cleanup done.${reset}"
 }
-
 cleanup_flatpak_remotes user
 echo
 cleanup_flatpak_remotes system
 echo -e "\n\n\n"
 
-# Delete unwanted Manjaro GNOME extensions, keeping only anything with "pamac" in the name (case-insensitive)
-echo -e "${cyan}Checking for unwanted Manjaro Gnome extensions...${reset}"
 
+
+# Cleaning unwanted Manjaro Gnome extensions
+echo -e "${cyan}Checking for unwanted Manjaro Gnome extensions...${reset}"
 mapfile -t unwanted_exts < <(find /usr/share/gnome-shell/extensions/ \
   -mindepth 1 -maxdepth 1 -type d \
   ! -iname '*pamac*')
-
 if [[ ${#unwanted_exts[@]} -eq 0 ]]; then
   echo
   echo -e "${cyan}No Manjaro Gnome extensions found.${reset}"
@@ -1776,22 +1645,20 @@ else
 fi
 echo -e "\n\n\n"
 
-# Cleanup thumbnails, screenshots, downloads, and trash
+
+
+# Cleaning thumbnails, screenshots, downloads, and trash
 echo -e "${cyan}Checking thumbnails, screenshots, downloads, and trash...${reset}"
 echo
-
 TARGETS=(
   "$HOME/.cache/thumbnails"
   "$HOME/Screenshots"
   "$HOME/Downloads"
 )
-
-# Add all trash subfolders
 TRASH_SUBFOLDERS=(files info expunged)
 for SUB in "${TRASH_SUBFOLDERS[@]}"; do
     TARGETS+=("$HOME/.local/share/Trash/$SUB")
 done
-
 for DIR in "${TARGETS[@]}"; do
     if [ -d "$DIR" ]; then
         if find "$DIR" -mindepth 1 -print -quit 2>/dev/null | read -r _; then
@@ -1808,38 +1675,33 @@ for DIR in "${TARGETS[@]}"; do
     fi
 done
 echo -e "\n\n\n"
-
-# === Orphaned Home App Data Cleanup (exclude instead of quarantine) ===
 echo -e "${cyan}Checking orphaned app configs...${reset}\n"
 
-normalize_key() { tr '[:upper:]' '[:lower:]' <<<"$1" | sed 's/[^a-z0-9]//g'; }
 
-# --- Persistent exclude list (in $HOME) ---
+
+# Clean Home folder leftovers 
+normalize_key() { tr '[:upper:]' '[:lower:]' <<<"$1" | sed 's/[^a-z0-9]//g'; }
 EXCLUDE_FILE="$HOME/.orphaned_home_apps.exclude"
 touch "$EXCLUDE_FILE"
 chmod 600 "$EXCLUDE_FILE"
-
 declare -A EXCLUDED_PATHS=()
 while IFS= read -r line; do
   [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
   EXCLUDED_PATHS["$line"]=1
 done < "$EXCLUDE_FILE"
 
+# Helper function: exclude_path
 exclude_path() {
   local p="$1"
   [[ -n "${EXCLUDED_PATHS[$p]:-}" ]] && return 0
   printf '%s\n' "$p" >> "$EXCLUDE_FILE"
   EXCLUDED_PATHS["$p"]=1
 }
-
-# --- Build installed set ---
 declare -A INSTALLED_SET=()
-
 while IFS= read -r pkg; do
   k=$(normalize_key "$pkg")
   [[ -n "$k" ]] && INSTALLED_SET["$k"]=1
 done < <(pacman -Qq 2>/dev/null || true)
-
 while IFS= read -r appid; do
   [[ -z "$appid" ]] && continue
   k_full=$(normalize_key "$appid")
@@ -1847,25 +1709,24 @@ while IFS= read -r appid; do
   [[ -n "$k_full" ]] && INSTALLED_SET["$k_full"]=1
   [[ -n "$k_last" ]] && INSTALLED_SET["$k_last"]=1
 done < <(flatpak list --app --columns=application 2>/dev/null || true)
-
 SCAN_DIRS=("$HOME/.config" "$HOME/.cache" "$HOME/.local/share" "$HOME/.local/state")
-
 KEEP_BASENAMES=("Trash" "dconf" "gtk-3.0" "gtk-4.0" "fontconfig" "pulse" "pipewire")
+
+# Helper function: is_kept_basename.
 is_kept_basename() {
   local b="$1"
   for k in "${KEEP_BASENAMES[@]}"; do [[ "$b" == "$k" ]] && return 0; done
   return 1
 }
-
 : "${ORPHAN_FUZZY:=1}"
 
+# Helper function: matches_installed.
 matches_installed() {
   local base="$1"
   local key
   key=$(normalize_key "$base")
   [[ ${#key} -lt 3 ]] && return 0
   [[ -n "${INSTALLED_SET[$key]:-}" ]] && return 0
-
   if (( ORPHAN_FUZZY == 1 )); then
     local k
     for k in "${!INSTALLED_SET[@]}"; do
@@ -1875,42 +1736,30 @@ matches_installed() {
   fi
   return 1
 }
-
 CANDIDATES=()
-
 for dir in "${SCAN_DIRS[@]}"; do
   [[ -d "$dir" ]] || continue
-
   while IFS= read -r -d '' entry; do
     base=${entry##*/}
-
     is_kept_basename "$base" && continue
     matches_installed "$base" && continue
-
-    # Canonicalize early so exclusions work even if symlinks are involved.
     entry_real=$(realpath -e -- "$entry" 2>/dev/null || printf '%s' "$entry")
     [[ -n "${EXCLUDED_PATHS[$entry_real]:-}" ]] && continue
-
     CANDIDATES+=("$entry_real")
   done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
 done
-
 mkdir -p /tmp/manjaro
 outfile=$(mktemp -p /tmp/manjaro orphaned_home_apps.XXXXXX.txt 2>/dev/null || echo "/tmp/manjaro/orphaned_home_apps.txt")
 printf "%s\n" "${CANDIDATES[@]}" > "$outfile"
-
 DELETED_ANY=false
-
 if (( ${#CANDIDATES[@]} == 0 )); then
   echo -e "${cyan}No orphaned app configs detected.${reset}"
 else
   echo -e "${orange}Probable orphaned app directories found (${#CANDIDATES[@]}).${reset}"
   echo -e "${blue}Saved list:${reset} $outfile"
   echo -e "${blue}Exclude list:${reset} $EXCLUDE_FILE\n"
-
   for candidate in "${CANDIDATES[@]}"; do
     [[ -d "$candidate" ]] || continue
-
     cand_real=$(realpath -e -- "$candidate" 2>/dev/null || printf '%s' "$candidate")
     case "$cand_real" in
       "$HOME/.config/"*|"$HOME/.cache/"*|"$HOME/.local/share/"*|"$HOME/.local/state/"*) ;;
@@ -1919,12 +1768,10 @@ else
         continue
         ;;
     esac
-
     echo -e "$cand_real"
     echo -ne "${yellow}(e)xclude forever  (d)elete permanently  (s)kip: ${reset}"
     read -r action
     echo
-
     case "${action,,}" in
       e|"")
         exclude_path "$cand_real"
@@ -1945,32 +1792,34 @@ else
     echo
   done
 fi
-
 if $DELETED_ANY; then
   echo -e "${green}Orphaned app configs cleaned.${reset}"
 fi
 
-# Clean yay package cache (auto-confirm)
+
+
+# Clean yay package cache
 if ! run_command bash -c "yes | yay -Scc"; then
   echo
   echo -e "${red}Failed to clean package cache with yay -Scc, trying manual cache deletion...${reset}"
   run_command rm -rf "$HOME/.cache/yay/"*
 fi
-((++current_step)); show_progress $current_step $total_steps
 
+
+
+((++current_step)); show_progress $current_step $total_steps
 echo -e "\n\n\n\n${purple}$(printf '%*s' 44 '' | tr ' ' '-') .Pacsave .Pacnew handling $(printf '%*s' 44 '' | tr ' ' '-')${reset}"
 echo -e "\n\n\n"
 
+
+
 # Pacnew Pacsave handling
-# --- Pacnew/Pacsave Discovery ---
 mapfile -t pac_files < <(
   sudo find / \
     \( -path "/.snapshots" -prune \) -o \
     -regextype posix-extended -regex ".+\.pac(new|save)" -print 2>/dev/null
 )
-
 echo -e "${cyan}Checking for .pacnew and .pacsave files...${reset}"
-
 if [ "${#pac_files[@]}" -eq 0 ]; then
   echo
   echo -e "${cyan}No .pacnew or .pacsave found.${reset}"
@@ -1979,60 +1828,43 @@ else
   echo -e "${red}Found: ${#pac_files[@]} files${reset}"
   printf '%s\n' "${pac_files[@]}"
   echo
-
-# --- Prompt for Handling ---
   echo -ne "${yellow}Deal with .pacsave/.pacnew? (n)o or any other key: ${reset}"
   read -r choice
   if [[ ! "$choice" =~ ^[Nn]$ ]]; then
-
-# --- Pacnew/Pacsave Review ---
     echo
     echo -ne "${yellow}Press Enter to review...${reset}"
     read -r
     echo
-
     rm -rf ~/meld-temp
     mkdir -p ~/meld-temp
     sudo chown "$USER":"$USER" ~/meld-temp
     chmod 700 ~/meld-temp
-
     declare -A siblings
-
     for pac_file in "${pac_files[@]}"; do
       dir=$(dirname "$pac_file")
       base=$(basename "$pac_file")
       base_name="${base%.pacnew}"
       base_name="${base_name%.pacsave}"
-
       for match in "$dir"/"$base_name"*; do
         [[ "$match" == "$pac_file" ]] && continue
         [[ "$match" == *.pacnew || "$match" == *.pacsave ]] && continue
-
         if [[ -f "$match" ]]; then
           siblings["$pac_file"]="$match"
-
-          # Delete all old backups
           for old_backup in "$match".backup-*; do
             [[ -e "$old_backup" ]] && sudo rm -f "$old_backup"
           done
-
-          # Create new backup
           backup="${match}.backup-$(date +%Y%m%d-%H%M%S)"
           echo -e "${cyan}Backing up sibling:${reset} $match -> $backup"
           sudo cp -a "$match" "$backup"
-
           break
         fi
       done
     done
-
-    # Copy pacnew/pacsave files and siblings to ~/meld-temp
     for pac_file in "${pac_files[@]}"; do
       dest=~/meld-temp"${pac_file}"
       mkdir -p "$(dirname "$dest")"
       sudo cp -a "$pac_file" "$dest"
       sudo chown "$USER":"$USER" "$dest"
-
       sibling="${siblings[$pac_file]}"
       if [[ -n "$sibling" ]]; then
         sibling_dest=~/meld-temp"${sibling}"
@@ -2041,19 +1873,15 @@ else
         sudo chown "$USER":"$USER" "$sibling_dest"
       fi
     done
-
     declare -A processed
     for pac_file in "${pac_files[@]}"; do
       [[ ${processed["$pac_file"]} ]] && continue
-
       temp_file=~/meld-temp"${pac_file}"
       sibling="${siblings[$pac_file]}"
       sibling_temp=~/meld-temp"${sibling}"
-
       echo
       echo -e "${cyan}Processing:${reset} $temp_file"
       echo
-
       if [[ -n "$sibling" && -f "$sibling_temp" ]]; then
         echo -e "${cyan}Launching meld for:$reset\n$temp_file\n$sibling_temp"
         meld "$sibling_temp" "$temp_file"
@@ -2064,7 +1892,6 @@ else
         gnome-text-editor "$temp_file" &> /dev/null
         processed["$pac_file"]=1
       fi
-
       if [[ "$pac_file" == *.pacnew || "$pac_file" == *.pacsave ]]; then
         echo
         echo -ne "${red}Delete $temp_file? (y)es or any other key: ${reset}"
@@ -2074,13 +1901,11 @@ else
           rm -v "$temp_file"
         fi
       fi
-
       echo
       echo -ne "${yellow}Press Enter to continue to next file...${reset}"
       read -r
       echo
     done
-
     echo -ne "${yellow}Finalize all changes to files? (y)es or any key to continue with the script: ${reset}"
     read -r sync
     echo
@@ -2088,7 +1913,6 @@ else
       for pac_file in "${pac_files[@]}"; do
         original_file="$pac_file"
         temp_file=~/meld-temp"${pac_file}"
-
         if [[ -f "$temp_file" ]]; then
           if ! cmp -s "$temp_file" "$original_file"; then
             echo -e "${cyan}Copying back: $temp_file → $original_file${reset}"
@@ -2101,11 +1925,9 @@ else
           sudo rm -f "$original_file"
         fi
       done
-
       total_count=0
       updated_count=0
       unchanged_count=0
-
       for pac_file in "${pac_files[@]}"; do
         sibling="${siblings[$pac_file]}"
         if [[ -n "$sibling" ]]; then
@@ -2133,13 +1955,10 @@ else
         echo
         echo -e "${cyan}Config files sync summary:${reset}  ${blue}Total: $total_count${reset}  ${green}Updated: $updated_count${reset}  ${yellow}Unchanged: $unchanged_count${reset}"
       fi
-
     else
       echo
       echo -e "\n${cyan}Continuing without syncing changes...${reset}"
     fi
-
-    # Cleanup
     rm -rf ~/meld-temp
     echo -e "\n\n\n"
   else
@@ -2148,15 +1967,17 @@ else
   fi
 fi
 
-# --- Old Backups Cleanup (always runs now) ---
+
+
+# Old Backups Cleanup
 echo
 echo
 echo -e "${cyan}Checking for .pacnew, .pacsave, and config backup files older than 30 days...${reset}"
-
 today=$(date +%s)
 cutoff_days=30
 cutoff_secs=$((cutoff_days * 86400))
 
+# Helper function: find_old_files.
 find_old_files() {
   while read -r file; do
     if [[ "$file" =~ \.backup-([0-9]{8})- ]]; then
@@ -2172,14 +1993,12 @@ find_old_files() {
     fi
   done
 }
-
 mapfile -t pac_files < <(
   sudo find / \
     \( -path "/.snapshots" -prune \) -o \
     -type f \( -name "*.pacnew" -o -name "*.pacsave" -o -name "*.backup-[0-9]*" \) -print 2>/dev/null |
   find_old_files
 )
-
 if [ "${#pac_files[@]}" -eq 0 ]; then
   echo
   echo -e "${cyan}No files found${reset}"
@@ -2188,10 +2007,8 @@ else
   echo -e "${red}Found: ${#pac_files[@]} files${reset}"
   printf '%s\n' "${pac_files[@]}"
   echo
-
   deleted_count=0
   skipped_count=0
-
   for file in "${pac_files[@]}"; do
     echo -ne "${yellow}Delete $file? (y)es or any other key: ${reset}"
     read -r confirm
@@ -2205,59 +2022,49 @@ else
       ((skipped_count++))
     fi
   done
-
   echo -e "\n${cyan}Cleanup summary:${reset}  ${cyan}Total: $((deleted_count + skipped_count))${reset}  ${red}Deleted: $deleted_count${reset}   ${yellow}Skipped: $skipped_count${reset}"
 fi
 
-# Pacnew Pacsave handling
-((++current_step)); show_progress $current_step $total_steps
 
+
+((++current_step)); show_progress $current_step $total_steps
 echo -e "\n\n\n\n${purple}$(printf '%*s' 55 '' | tr ' ' '-') End $(printf '%*s' 55 '' | tr ' ' '-')${reset}"
 echo -e "\n\n\n"
 
-# Packages and installation size after
-explicit_count2=$(pacman -Qe | wc -l)
 
+
+# Stats after updates
+explicit_count2=$(pacman -Qe | wc -l)
 read total used avail <<< $(df / --block-size=1 | awk 'NR==2 {print $2, $3, $4}')
 percent=$(awk -v u="$used" -v t="$total" 'BEGIN { printf "%.1f", (u/t)*100 }')
 used_gb2=$(awk -v u="$used" 'BEGIN { printf "%.1f", u/1e9 }')
-
-# Calculate differences
 explicit_diff=$((explicit_count2 - explicit_count))
 used_diff=$(awk -v u1="$used_gb2" -v u2="$used_gb" 'BEGIN { d = u1 - u2; printf "%+.1f", d }')
-
 echo -e "${reset}Disk used: ${used_gb2}GB${reset}  diff: ${orange}${used_diff}${reset}GB"
 echo -e "${reset}Programs: ${explicit_count2}${reset}  diff: ${orange}${explicit_diff}${reset}"
 echo
 
+
+
+# Helper function: list_flatpaks_with_repo_check.
 list_flatpaks_with_repo_check() {
     local repo_file="/tmp/manjaro/repo_pkgs.txt"
-
-    # Check repo file
     if [[ ! -f "$repo_file" ]]; then
         echo -e "${red}Repo package list not found! Run pacman -Sl > $repo_file first.${reset}"
         return 1
     fi
-
-    # Lowercase repo file once for case-insensitive matching
     local repo_file_lower="/tmp/manjaro/repo_pkgs_lower.txt"
     if [[ ! -f "$repo_file_lower" || "$repo_file_lower" -ot "$repo_file" ]]; then
         tr '[:upper:]' '[:lower:]' < "$repo_file" > "$repo_file_lower"
     fi
-
-    # Get installed Flatpaks
     mapfile -t flatpaks < <(flatpak list --app --columns=application 2>/dev/null | sort)
     if (( ${#flatpaks[@]} == 0 )); then
         echo -e "${orange}No Flatpaks installed.${reset}"
         return 0
     fi
-
     echo -e "${cyan}Flatpaks:  ${orange}${#flatpaks[@]}${reset}"
     for app in "${flatpaks[@]}"; do
-        # Extract last dot segment (actual app name)
         local app_base="${app##*.}"
-
-        # Case-insensitive search in repo
         if grep -qiF "$app_base" "$repo_file_lower"; then
             echo -e "${app} ${orange}   in Manjaro repos${reset}"
         else
@@ -2267,40 +2074,32 @@ list_flatpaks_with_repo_check() {
     echo
 }
 
+
+
+# Helper function: list_aur_with_repo_check.
 list_aur_with_repo_check() {
     local repo_file="/tmp/manjaro/repo_pkgs.txt"
-
-    # Check repo file
     if [[ ! -f "$repo_file" ]]; then
         echo -e "${red}Repo package list not found! Run pacman -Sl > $repo_file first.${reset}"
         return 1
     fi
-
-    # Lowercase repo file once for case-insensitive matching
     local repo_file_lower="/tmp/manjaro/repo_pkgs_lower.txt"
     if [[ ! -f "$repo_file_lower" || "$repo_file_lower" -ot "$repo_file" ]]; then
         tr '[:upper:]' '[:lower:]' < "$repo_file" > "$repo_file_lower"
     fi
-
-    # Same default suffix idea as in your replace logic
     local defaultsuffixes=(
         -git -bin -vcs -aur -devel -nightly -wayland -stable -legacy -nox
         -gtk2 -gtk3 -gtk4 -qt4 -qt5 -qt6 -beta -alpha
     )
     local suffixes=("${defaultsuffixes[@]}")
-
-    # Get installed AUR (foreign) packages
     mapfile -t aurpkgs < <(pacman -Qm | awk '{print $1}' | sort)
     if (( ${#aurpkgs[@]} == 0 )); then
         echo -e "${orange}No AUR packages installed.${reset}"
         return 0
     fi
-
     echo -e "${cyan}AUR packages:  ${orange}${#aurpkgs[@]}${reset}"
     for pkg in "${aurpkgs[@]}"; do
         local base="$pkg"
-
-        # Treat foo-git as foo (and similar suffix variants)
         local suf
         for suf in "${suffixes[@]}"; do
             if [[ "$base" == *"$suf" ]]; then
@@ -2308,8 +2107,6 @@ list_aur_with_repo_check() {
                 break
             fi
         done
-
-        # Case-insensitive search in repo (check base first, then fallback to full)
         if grep -qiF "$base" "$repo_file_lower" || grep -qiF "$pkg" "$repo_file_lower"; then
             echo -e "${pkg} ${orange}   in Manjaro repos${reset}"
         else
@@ -2321,12 +2118,10 @@ list_aur_with_repo_check() {
 list_aur_with_repo_check
 list_flatpaks_with_repo_check
 
-# Print a message only if Manjaro repos offer a newer LTS kernel *series* than you have installed.
-# Otherwise print nothing.
+
+
+# Helper function: check_newer_manjaro_lts_kernel.
 check_newer_manjaro_lts_kernel() {
-  # Map Manjaro kernel series name -> "major.minor"
-  # linux66  -> 6.6
-  # linux515 -> 5.15
   _k_mm() {
     local k="${1#linux}" major minor
     if ((${#k} == 2)); then
@@ -2338,8 +2133,6 @@ check_newer_manjaro_lts_kernel() {
     fi
     printf '%d.%d\n' "$((10#$major))" "$((10#$minor))"
   }
-
-  # Get upstream longterm (LTS) major.minor list (e.g. 6.12, 6.6, 6.1, 5.15, ...)
   local lts_mm
   if ! lts_mm="$(
     curl -fsSL 'https://www.kernel.org/releases.json' |
@@ -2355,12 +2148,8 @@ print("\n".join(sorted(out, key=lambda s: tuple(map(int,s.split("."))))))
   )"; then
     return 0  # stay silent on network/parse errors
   fi
-
-  # Available + installed Manjaro kernel series (linuxXY, linuxXYZ), ignoring -rt
   mapfile -t avail < <(mhwd-kernel -l  | grep -oE 'linux[0-9]+' | sort -u)
   mapfile -t inst  < <(mhwd-kernel -li | grep -oE 'linux[0-9]+' | sort -u)
-
-  # Newest available LTS series in Manjaro repos
   local latest_avail_line latest_avail_mm latest_avail_k
   latest_avail_line="$(
     for k in "${avail[@]}"; do
@@ -2371,8 +2160,6 @@ print("\n".join(sorted(out, key=lambda s: tuple(map(int,s.split("."))))))
   )"
   [[ -n "$latest_avail_line" ]] || return 0
   read -r latest_avail_mm latest_avail_k <<<"$latest_avail_line"
-
-  # Newest installed LTS series
   local latest_inst_line latest_inst_mm latest_inst_k
   latest_inst_line="$(
     for k in "${inst[@]}"; do
@@ -2387,18 +2174,10 @@ print("\n".join(sorted(out, key=lambda s: tuple(map(int,s.split("."))))))
     latest_inst_mm=""
     latest_inst_k=""
   fi
-
-  # Prompt only if available LTS series is newer than installed LTS series
   if [[ -z "$latest_inst_mm" ]] || \
      [[ "$(printf '%s\n%s\n' "$latest_inst_mm" "$latest_avail_mm" | sort -V | tail -n1)" != "$latest_inst_mm" ]]; then
     echo -e "${red}Newer LTS kernel series available: ${orange}${latest_avail_k}${reset} (installed LTS: ${latest_inst_k:-none})"
   fi
 }
-
-# Usage:
-# check_newer_manjaro_lts_kernel
 check_newer_manjaro_lts_kernel
-
-# Keep the terminal open so you can actually see the report
- #printf "%b" "${yellow}Press Enter to close...${reset}"
  read -r </dev/tty
