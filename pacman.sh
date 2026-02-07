@@ -1233,18 +1233,18 @@ perform_updates() {
     local log_start
     log_start=$(wc -l < "$pacman_log" 2>/dev/null || echo 0)
 
-    echo -e "\n\n\n${cyan}Running: sudo pacman -Syyu --noconfirm${reset}"
-    sudo pacman -Syyu --noconfirm
+    echo -e "\n\n\n${cyan}Running: sudo pacman -Syyu --noconfirm >&3 2>&4${reset}"
+    sudo pacman -Syyu --noconfirm >&3 2>&4
     local status=$?
     if (( status == 0 )); then
-  echo -e "${green}Command 'sudo pacman -Syyu --noconfirm' completed successfully.${reset}"
+  echo -e "${green}Command 'sudo pacman -Syyu --noconfirm >&3 2>&4' completed successfully.${reset}"
 else
-  echo -e "${red}Command 'sudo pacman -Syyu --noconfirm' failed with exit code ${status}.${reset}"
+  echo -e "${red}Command 'sudo pacman -Syyu --noconfirm >&3 2>&4' failed with exit code ${status}.${reset}"
 fi
 
     [[ -r "$pacman_log" ]] || : > "$pacman_tmp_log"
     tail -n +"$((log_start + 1))" "$pacman_log" > "$pacman_tmp_log" 2>/dev/null
-
+    cat "$pacman_tmp_log" >> "$log_path"
     if (( status == 0 )); then
       (( had_pipefail == 0 )) && set +o pipefail
       break
