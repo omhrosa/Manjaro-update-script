@@ -261,6 +261,7 @@ deps_check_and_install() {
   [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]] || return 1
 
   # Install yay first, then install repo deps and finally AUR deps.
+  sudo pacman -Sy --noconfirm || return 1
   if ((need_yay)); then
     sudo pacman -S --needed --noconfirm yay || return 1
     # Remove yay from repo list so it isn't reinstalled
