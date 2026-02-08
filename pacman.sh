@@ -261,7 +261,7 @@ deps_check_and_install() {
   [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]] || return 1
 
   # Install yay first, then install repo deps and finally AUR deps.
-  sudo pacman -Sy --noconfirm || return 1
+  sudo pacman -Syy --noconfirm || return 1
   if ((need_yay)); then
     sudo pacman -S --needed --noconfirm yay || return 1
     # Remove yay from repo list so it isn't reinstalled
@@ -700,7 +700,7 @@ prompt_for_db_lock_resolution() {
           echo -e "${yellow}Close pamac/Octopi or kill the shown PID, then retry.${reset}" > /dev/tty
         else
           echo -e "${cyan}No process reported. Deleting lock file...${reset}" > /dev/tty
-          if sudo rm -f /var/lib/pacman/db.lck*; then
+          if sudo rm -f /var/lib/pacman/db.lck; then
             echo -e "${green}Lock file deleted.${reset}" > /dev/tty
           else
             echo -e "${red}Failed to delete lock file.${reset}" > /dev/tty
@@ -833,7 +833,7 @@ echo -e "\n\n\n"
 # Dry run to check imminent updates volume
 echo -e "${yellow}Checking real update size (dry run)...${reset}"
 prompt_for_db_lock_resolution
-sudo pacman -Sy --noconfirm >/dev/null
+sudo pacman -Syy --noconfirm >/dev/null
 mapfile -t repo_up < <(pacman -Qu 2>/dev/null)
 total_bytes=0
 if (( ${#repo_up[@]} == 0 )); then
@@ -861,154 +861,183 @@ fi
 replace_aur_with_repo() {
 echo -e "\n\n\n"
 echo -e "${cyan}Checking for AUR packages that now exist in Manjaro repos...${reset}"
+
 local exclude_file="$HOME/.aur_excluded_pkg"
 sudo -u "$USER" touch "$exclude_file"
+
 declare -A excluded=()
 while IFS= read -r line; do
-[[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-excluded["$line"]=1
+  [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+  excluded["$line"]=1
 done < "$exclude_file"
+
 local default_suffixes=(
 "-git" "-bin" "-vcs" "-aur" "-devel" "-nightly" "-wayland" "-stable" "-legacy"
 "-nox" "-gtk2" "-gtk3" "-gtk4" "-qt4" "-qt5" "-qt6" "-beta" "-alpha"
 )
 local suffixes=("${default_suffixes[@]}")
+
 if [[ ! -f /tmp/manjaro/repo_pkgs.txt ]]; then
-echo -e "${red}Repo package list file /tmp/manjaro/repo_pkgs.txt not found! Run pacman -Sl to generate it.${reset}"
-return 1
+  echo -e "${red}Repo package list file /tmp/manjaro/repo_pkgs.txt not found! Run pacman -Sl to generate it.${reset}"
+  return 1
 fi
+
 mapfile -t repo_pkgs < "/tmp/manjaro/repo_pkgs.txt"
 mapfile -t aur_pkgs < <(pacman -Qm | awk '{print $1}' | sort)
+
 if (( ${#aur_pkgs[@]} == 0 )); then
-echo
-echo -e "${orange}No AUR packages detected.${green} Nothing to check.${reset}"
-return 0
+  echo
+  echo -e "${orange}No AUR packages detected.${green} Nothing to check.${reset}"
+  return 0
 fi
+
+# Shared replacement list (parent scope)
+local -a to_replace=()
 
 # Helper function: add_to_exclude_file.
 add_to_exclude_file() {
-local pkg="$1"
-if ! grep -qxF "$pkg" "$exclude_file"; then
-printf '%s\n' "$pkg" >> "$exclude_file"
-fi
-excluded["$pkg"]=1
+  local pkg="$1"
+  if ! grep -qxF "$pkg" "$exclude_file"; then
+    printf '%s\n' "$pkg" >> "$exclude_file"
+  fi
+  excluded["$pkg"]=1
 }
 
 # Helper function: fuzzy_match.
 fuzzy_match() {
-local aur_pkg="$1" # original AUR name
-local aur_base="$2" # stripped base used for searching
-local aur_base_esc
-aur_base_esc=$(printf '%s' "$aur_base" | sed -e 's/[][(){}.^$*+?|\\]/\\&/g')
-mapfile -t matches < <(printf '%s\n' "${repo_pkgs[@]}" | grep -iE "(^|[-_])${aur_base_esc}($|[-_])")
-if (( ${#matches[@]} == 0 )); then
-echo ""
-return
-fi
-{
-echo
-echo -e "${yellow}Fuzzy matches for '$aur_base' (from AUR '$aur_pkg'):${reset}"
-local i=1
-for match in "${matches[@]}"; do
-echo " [$i] $match"
-((i++))
-done
-echo " [0] Skip"
-echo " [x] Exclude '$aur_pkg' permanently"
-} > /dev/tty
-local choice
-while true; do
-echo -ne "${cyan}Choose number / 0 / x: ${reset}" > /dev/tty
-read -r choice < /dev/tty
-if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 0 && choice < i )); then
-break
-elif [[ "${choice,,}" == "x" ]]; then
-break
-fi
-done
-if [[ "${choice,,}" == "x" ]]; then
-add_to_exclude_file "$aur_pkg"
-echo ""
-elif (( choice == 0 )); then
-echo ""
-else
-echo "${matches[choice-1]}"
-fi
+  local aur_pkg="$1"
+  local aur_base="$2"
+  local aur_base_esc
+  aur_base_esc=$(printf '%s' "$aur_base" | sed -e 's/[][(){}.^$*+?|\\]/\\&/g')
+
+  mapfile -t matches < <(
+    printf '%s\n' "${repo_pkgs[@]}" |
+    grep -iE "(^|[-_])${aur_base_esc}($|[-_])"
+  )
+
+  if (( ${#matches[@]} == 0 )); then
+    echo ""
+    return
+  fi
+
+  {
+    echo
+    echo -e "${yellow}Fuzzy matches for '$aur_base' (from AUR '$aur_pkg'):${reset}"
+    local i=1
+    for match in "${matches[@]}"; do
+      echo " [$i] $match"
+      ((i++))
+    done
+    echo " [0] Skip"
+    echo " [x] Exclude '$aur_pkg' permanently"
+  } > /dev/tty
+
+  local choice
+  while true; do
+    echo -ne "${cyan}Choose number / 0 / x: ${reset}" > /dev/tty
+    read -r choice < /dev/tty
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 0 && choice < i )); then
+      break
+    elif [[ "${choice,,}" == "x" ]]; then
+      break
+    fi
+  done
+
+  if [[ "${choice,,}" == "x" ]]; then
+    add_to_exclude_file "$aur_pkg"
+    echo ""
+  elif (( choice == 0 )); then
+    echo ""
+  else
+    echo "${matches[choice-1]}"
+  fi
 }
 
 # Helper function: find_aur_replacements.
 find_aur_replacements() {
-local aur_pkgs=("$@")
-to_replace=()
-for aur in "${aur_pkgs[@]}"; do
-if [[ -n "${excluded[$aur]:-}" ]]; then
-echo -e "Excluded from replacement (persistent):${blue} ${aur}${reset}"
-continue
-fi
-local base="$aur"
-for suf in "${suffixes[@]}"; do
-if [[ "$aur" == *"$suf" ]]; then
-base="${aur%"$suf"}"
-break
-fi
-done
-if [[ " ${repo_pkgs[*]} " == *" $base "* ]]; then
-to_replace+=("$aur|$base")
-else
-local matched_pkg
-matched_pkg=$(fuzzy_match "$aur" "$base")
-[[ -n "$matched_pkg" ]] && to_replace+=("$aur|$matched_pkg") || true
-fi
-done
+  local aur_pkgs=("$@")
+  to_replace=()   # reset shared array
+
+  for aur in "${aur_pkgs[@]}"; do
+    if [[ -n "${excluded[$aur]:-}" ]]; then
+      echo -e "Excluded from replacement (persistent):${blue} ${aur}${reset}"
+      continue
+    fi
+
+    local base="$aur"
+    for suf in "${suffixes[@]}"; do
+      if [[ "$aur" == *"$suf" ]]; then
+        base="${aur%"$suf"}"
+        break
+      fi
+    done
+
+    if [[ " ${repo_pkgs[*]} " == *" $base "* ]]; then
+      to_replace+=("$aur|$base")
+    else
+      local matched_pkg
+      matched_pkg="$(fuzzy_match "$aur" "$base")"
+      [[ -n "$matched_pkg" ]] && to_replace+=("$aur|$matched_pkg") || true
+    fi
+  done
 }
+
 find_aur_replacements "${aur_pkgs[@]}"
+
 local valid_replace=()
 for entry in "${to_replace[@]}"; do
-local aur="${entry%%|*}"
-local base="${entry##*|}"
-if [[ -n "$aur" && -n "$base" ]]; then
-valid_replace+=("$entry")
-fi
+  local aur="${entry%%|*}"
+  local base="${entry##*|}"
+  [[ -n "$aur" && -n "$base" ]] && valid_replace+=("$entry")
 done
+
 if (( ${#valid_replace[@]} == 0 )); then
-echo -e "${orange}No AUR packages found in official repos (after exclusions).${cyan} Nothing to replace.${reset}"
-return 0
+  echo -e "${orange}No AUR packages found in official repos (after exclusions).${cyan} Nothing to replace.${reset}"
+  return 0
 fi
+
 echo
 echo -e "${yellow}The following AUR packages are now in the official repos:${reset}"
 printf "%-30s %-30s\n" "AUR Package" "Repo Package"
 printf "%-30s %-30s\n" "-----------" "------------"
+
 for entry in "${valid_replace[@]}"; do
-local aur="${entry%%|*}"
-local base="${entry##*|}"
-printf "%-30s %-30s\n" "$aur" "$base"
+  local aur="${entry%%|*}"
+  local base="${entry##*|}"
+  printf "%-30s %-30s\n" "$aur" "$base"
 done
+
 echo
 echo -ne "${cyan}Proceed with replacing them? (y)es or any other key to skip: ${reset}"
 read -r choice < /dev/tty
+
 if [[ "$choice" =~ ^[Yy]$ ]]; then
-for entry in "${valid_replace[@]}"; do
-local aur="${entry%%|*}"
-local base="${entry##*|}"
-echo -e "${cyan}Removing AUR package: $aur...${reset}"
-if ! run_command yay -Rns --noconfirm "$aur"; then
-echo -e "${red}Failed to remove $aur. Skipping this package.${reset}"
-continue
-fi
-echo -e "${cyan}Installing repo package: $base...${reset}"
-prompt_for_db_lock_resolution
-if ! run_command sudo pacman -S --noconfirm "$base"; then
-echo -e "${red}Failed to install $base. Attempting to reinstall $aur...${reset}"
-run_command yay -S --noconfirm "$aur"
-continue
-fi
-echo -e "${green}Replaced $aur with $base successfully.${reset}"
-done
-echo
-echo -e "${green}All replacements completed.${reset}"
+  for entry in "${valid_replace[@]}"; do
+    local aur="${entry%%|*}"
+    local base="${entry##*|}"
+
+    echo -e "${cyan}Removing AUR package: $aur...${reset}"
+    if ! run_command yay -Rns --noconfirm "$aur"; then
+      echo -e "${red}Failed to remove $aur. Skipping this package.${reset}"
+      continue
+    fi
+
+    echo -e "${cyan}Installing repo package: $base...${reset}"
+    prompt_for_db_lock_resolution
+    if ! run_command sudo pacman -S --noconfirm "$base"; then
+      echo -e "${red}Failed to install $base. Attempting to reinstall $aur...${reset}"
+      run_command yay -S --noconfirm "$aur"
+      continue
+    fi
+
+    echo -e "${green}Replaced $aur with $base successfully.${reset}"
+  done
+
+  echo
+  echo -e "${green}All replacements completed.${reset}"
 else
-echo
-echo -e "${red}Replacement operation skipped by user.${reset}"
+  echo
+  echo -e "${red}Replacement operation skipped by user.${reset}"
 fi
 }
 
@@ -1018,198 +1047,210 @@ fi
 replace_flatpaks_with_repo() {
 echo -e "\n\n\n"
 echo -e "${cyan}Checking for Flatpak apps that also exist as Manjaro repo packages...${reset}"
+
 local exclude_file="$HOME/.flatpak_excluded_app"
 touch "$exclude_file"
+
+local -a to_replace=()
 declare -A excluded=()
 while IFS= read -r line; do
-[[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-excluded["$line"]=1
+  [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+  excluded["$line"]=1
 done < "$exclude_file"
+
 local default_suffixes=(
 "-git" "-bin" "-vcs" "-aur" "-devel" "-nightly" "-wayland" "-stable" "-legacy"
 "-nox" "-gtk2" "-gtk3" "-gtk4" "-qt4" "-qt5" "-qt6" "-beta" "-alpha"
 )
 local suffixes=("${default_suffixes[@]}")
+
 if [[ ! -f /tmp/manjaro/repo_pkgs.txt ]]; then
-echo -e "${red}Repo package list file /tmp/manjaro/repo_pkgs.txt not found! Run pacman -Sl to generate it.${reset}"
-return 1
+  echo -e "${red}Repo package list file /tmp/manjaro/repo_pkgs.txt not found! Run pacman -Sl to generate it.${reset}"
+  return 1
 fi
+
 mapfile -t repo_pkgs < "/tmp/manjaro/repo_pkgs.txt"
+
 mapfile -t flatpak_rows < <(
-  flatpak list --app --columns=application,origin,installation 2>/dev/null \
-  | awk 'NF{print $1 "|" $2 "|" $3}' \
-  | sort -u
+  flatpak list --app --columns=application,origin,installation 2>/dev/null |
+  awk 'NF{print $1 "|" $2 "|" $3}' | sort -u
 )
+
 if (( ${#flatpak_rows[@]} == 0 )); then
-echo
-echo -e "${orange}No Flatpaks detected.${green} Nothing to check.${reset}"
-return 0
+  echo
+  echo -e "${orange}No Flatpaks detected.${green} Nothing to check.${reset}"
+  return 0
 fi
 
-# Helper function: add_to_exclude_file.
-add_to_exclude_file() {
-local appid="$1"
-if ! grep -qxF "$appid" "$exclude_file"; then
-printf '%s\n' "$appid" >> "$exclude_file"
-fi
-excluded["$appid"]=1
+# --- Flatpak-scoped helper functions ---
+
+fp_add_to_exclude_file() {
+  local appid="$1"
+  if ! grep -qxF "$appid" "$exclude_file"; then
+    printf '%s\n' "$appid" >> "$exclude_file"
+  fi
+  excluded["$appid"]=1
 }
 
-# Helper function: flatpak_base_from_appid.
-flatpak_base_from_appid() {
-local appid="$1"
-local last="${appid##*.}"
-local base="$last"
-case "$last" in
-Client|client|Desktop|desktop|App|app)
-local prev="${appid%.*}"
-base="${prev##*.}"
-;;
-esac
-local suf
-for suf in "${suffixes[@]}"; do
-if [[ "$base" == *"$suf" ]]; then
-base="${base%"$suf"}"
-break
-fi
-done
-printf '%s' "$base"
+fp_flatpak_base_from_appid() {
+  local appid="$1"
+  local last="${appid##*.}"
+  local base="$last"
+  case "$last" in
+    Client|client|Desktop|desktop|App|app)
+      local prev="${appid%.*}"
+      base="${prev##*.}"
+    ;;
+  esac
+  local suf
+  for suf in "${suffixes[@]}"; do
+    if [[ "$base" == *"$suf" ]]; then
+      base="${base%"$suf"}"
+      break
+    fi
+  done
+  printf '%s' "$base"
 }
 
-# Helper function: fuzzy_match.
-fuzzy_match() {
-local appid="$1"     # original flatpak id
-local base="$2"      # derived base used for searching
-local base_esc
-base_esc=$(printf '%s' "$base" | sed -e 's/[][(){}.^$*+?|\\]/\\&/g')
-mapfile -t matches < <(printf '%s\n' "${repo_pkgs[@]}" | grep -iE "(^|[-_])${base_esc}($|[-_])")
-if (( ${#matches[@]} == 0 )); then
-echo ""
-return
-fi
-{
-echo
-echo -e "${yellow}Fuzzy matches for '$base' (from Flatpak '$appid'):${reset}"
-local i=1
-for match in "${matches[@]}"; do
-echo " [$i] $match"
-((i++))
-done
-echo " [0] Skip"
-echo " [x] Exclude '$appid' permanently"
-} > /dev/tty
-local choice
-while true; do
-echo -ne "${cyan}Choose number / 0 / x: ${reset}" > /dev/tty
-read -r choice < /dev/tty
-if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 0 && choice < i )); then
-break
-elif [[ "${choice,,}" == "x" ]]; then
-break
-fi
-done
-if [[ "${choice,,}" == "x" ]]; then
-add_to_exclude_file "$appid"
-echo ""
-elif (( choice == 0 )); then
-echo ""
-else
-echo "${matches[choice-1]}"
-fi
+fp_fuzzy_match() {
+  local appid="$1"
+  local base="$2"
+  local base_esc
+  base_esc=$(printf '%s' "$base" | sed -e 's/[][(){}.^$*+?|\\]/\\&/g')
+
+  mapfile -t matches < <(
+    printf '%s\n' "${repo_pkgs[@]}" | grep -iE "(^|[-_])${base_esc}($|[-_])"
+  )
+
+  if (( ${#matches[@]} == 0 )); then
+    echo ""
+    return
+  fi
+
+  {
+    echo
+    echo -e "${yellow}Fuzzy matches for '$base' (from Flatpak '$appid'):${reset}"
+    local i=1
+    for match in "${matches[@]}"; do
+      echo " [$i] $match"
+      ((i++))
+    done
+    echo " [0] Skip"
+    echo " [x] Exclude '$appid' permanently"
+  } > /dev/tty
+
+  local choice
+  while true; do
+    echo -ne "${cyan}Choose number / 0 / x: ${reset}" > /dev/tty
+    read -r choice < /dev/tty
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 0 && choice < i )); then
+      break
+    elif [[ "${choice,,}" == "x" ]]; then
+      break
+    fi
+  done
+
+  if [[ "${choice,,}" == "x" ]]; then
+    fp_add_to_exclude_file "$appid"
+    echo ""
+  elif (( choice == 0 )); then
+    echo ""
+  else
+    echo "${matches[choice-1]}"
+  fi
 }
 
-# Helper function: find_flatpak_replacements.
-find_flatpak_replacements() {
-local rows=("$@")
-to_replace=()
-local row appid origin install base matched_pkg
-for row in "${rows[@]}"; do
-appid="${row%%|*}"
-origin="${row#*|}"; origin="${origin%%|*}"
-install="${row##*|}"
-if [[ -n "${excluded[$appid]:-}" ]]; then
-echo -e "Excluded from replacement (persistent):${blue} ${appid}${reset}"
-continue
-fi
-base="$(flatpak_base_from_appid "$appid")"
-if [[ " ${repo_pkgs[*]} " == *" $base "* ]]; then
-to_replace+=("$appid|$origin|$install|$base")
-else
-matched_pkg="$(fuzzy_match "$appid" "$base")"
-[[ -n "$matched_pkg" ]] && to_replace+=("$appid|$origin|$install|$matched_pkg") || true
-fi
-done
+fp_find_flatpak_replacements() {
+  local rows=("$@")
+  to_replace=()
+  local row appid origin install base matched_pkg
+
+  for row in "${rows[@]}"; do
+    appid="${row%%|*}"
+    origin="${row#*|}"; origin="${origin%%|*}"
+    install="${row##*|}"
+
+    if [[ -n "${excluded[$appid]:-}" ]]; then
+      echo -e "Excluded from replacement (persistent):${blue} ${appid}${reset}"
+      continue
+    fi
+
+    base="$(fp_flatpak_base_from_appid "$appid")"
+
+    if [[ " ${repo_pkgs[*]} " == *" $base "* ]]; then
+      to_replace+=("$appid|$origin|$install|$base")
+    else
+      matched_pkg="$(fp_fuzzy_match "$appid" "$base")"
+      [[ -n "$matched_pkg" ]] && to_replace+=("$appid|$origin|$install|$matched_pkg") || true
+    fi
+  done
 }
-find_flatpak_replacements "${flatpak_rows[@]}"
+
+fp_find_flatpak_replacements "${flatpak_rows[@]}"
+
 local valid_replace=()
 local entry appid origin install repo_pkg
+
 for entry in "${to_replace[@]}"; do
-appid="$(cut -d'|' -f1 <<<"$entry")"
-origin="$(cut -d'|' -f2 <<<"$entry")"
-install="$(cut -d'|' -f3 <<<"$entry")"
-repo_pkg="$(cut -d'|' -f4- <<<"$entry")"
-if [[ -n "$appid" && -n "$repo_pkg" ]]; then
-valid_replace+=("$entry")
-fi
+  appid="$(cut -d'|' -f1 <<<"$entry")"
+  origin="$(cut -d'|' -f2 <<<"$entry")"
+  install="$(cut -d'|' -f3 <<<"$entry")"
+  repo_pkg="$(cut -d'|' -f4- <<<"$entry")"
+  [[ -n "$appid" && -n "$repo_pkg" ]] && valid_replace+=("$entry")
 done
+
 if (( ${#valid_replace[@]} == 0 )); then
-echo -e "${orange}No Flatpaks found with matching Manjaro repo packages (after exclusions).${cyan} Nothing to replace.${reset}"
-return 0
+  echo -e "${orange}No Flatpaks found with matching Manjaro repo packages (after exclusions).${cyan} Nothing to replace.${reset}"
+  return 0
 fi
+
 echo
 echo -e "${yellow}The following Flatpaks appear to exist as Manjaro repo packages:${reset}"
 printf "%-45s %-8s %-20s %-30s\n" "Flatpak AppID" "Scope" "Origin" "Repo Package"
 printf "%-45s %-8s %-20s %-30s\n" "-----------" "-----" "------" "------------"
+
 for entry in "${valid_replace[@]}"; do
-appid="$(cut -d'|' -f1 <<<"$entry")"
-origin="$(cut -d'|' -f2 <<<"$entry")"
-install="$(cut -d'|' -f3 <<<"$entry")"
-repo_pkg="$(cut -d'|' -f4- <<<"$entry")"
-printf "%-45s %-8s %-20s %-30s\n" "$appid" "$install" "${origin:-NA}" "$repo_pkg"
+  appid="$(cut -d'|' -f1 <<<"$entry")"
+  origin="$(cut -d'|' -f2 <<<"$entry")"
+  install="$(cut -d'|' -f3 <<<"$entry")"
+  repo_pkg="$(cut -d'|' -f4- <<<"$entry")"
+  printf "%-45s %-8s %-20s %-30s\n" "$appid" "$install" "${origin:-NA}" "$repo_pkg"
 done
+
 echo
 echo -ne "${cyan}Proceed with replacing them? (y)es or any other key to skip: ${reset}"
 read -r choice < /dev/tty
+
 if [[ "$choice" =~ ^[Yy]$ ]]; then
-for entry in "${valid_replace[@]}"; do
-appid="$(cut -d'|' -f1 <<<"$entry")"
-origin="$(cut -d'|' -f2 <<<"$entry")"
-install="$(cut -d'|' -f3 <<<"$entry")"
-repo_pkg="$(cut -d'|' -f4- <<<"$entry")"
-echo -e "${cyan}Removing Flatpak app: $appid...${reset}"
-if [[ "$install" == "user" ]]; then
-if ! run_command flatpak uninstall -y --user "$appid"; then
-echo -e "${red}Failed to remove Flatpak (user): $appid. Skipping this app.${reset}"
-continue
-fi
+  for entry in "${valid_replace[@]}"; do
+    appid="$(cut -d'|' -f1 <<<"$entry")"
+    origin="$(cut -d'|' -f2 <<<"$entry")"
+    install="$(cut -d'|' -f3 <<<"$entry")"
+    repo_pkg="$(cut -d'|' -f4- <<<"$entry")"
+
+    echo -e "${cyan}Removing Flatpak app: $appid...${reset}"
+    if [[ "$install" == "user" ]]; then
+      run_command flatpak uninstall -y --user "$appid" || continue
+    else
+      run_command sudo flatpak uninstall -y --system "$appid" || continue
+    fi
+
+    echo -e "${cyan}Installing repo package: $repo_pkg...${reset}"
+    prompt_for_db_lock_resolution
+    if ! run_command sudo pacman -S --noconfirm "$repo_pkg"; then
+      echo -e "${red}Failed to install $repo_pkg. Attempting to reinstall Flatpak $appid...${reset}"
+      if [[ -n "$origin" && "$origin" != "NA" ]]; then
+        [[ "$install" == "user" ]] && run_command flatpak install -y --user "$origin" "$appid" \
+                                   || run_command sudo flatpak install -y --system "$origin" "$appid"
+      fi
+      continue
+    fi
+
+    echo -e "${green}Replaced Flatpak $appid with repo package $repo_pkg successfully.${reset}"
+  done
+  echo -e "${green}All Flatpak replacements completed.${reset}"
 else
-if ! run_command sudo flatpak uninstall -y --system "$appid"; then
-echo -e "${red}Failed to remove Flatpak (system): $appid. Skipping this app.${reset}"
-continue
-fi
-fi
-echo -e "${cyan}Installing repo package: $repo_pkg...${reset}"
-prompt_for_db_lock_resolution
-if ! run_command sudo pacman -S --noconfirm "$repo_pkg"; then
-echo -e "${red}Failed to install $repo_pkg. Attempting to reinstall Flatpak $appid...${reset}"
-if [[ -n "$origin" && "$origin" != "NA" ]]; then
-if [[ "$install" == "user" ]]; then
-run_command flatpak install -y --user "$origin" "$appid"
-else
-run_command sudo flatpak install -y --system "$origin" "$appid"
-fi
-else
-echo -e "${yellow}Flatpak origin unknown for $appid; reinstall skipped.${reset}"
-fi
-continue
-fi
-echo -e "${green}Replaced Flatpak $appid with repo package $repo_pkg successfully.${reset}"
-done
-echo
-echo -e "${green}All Flatpak replacements completed.${reset}"
-else
-echo
-echo -e "${red}Replacement operation skipped by user.${reset}"
+  echo -e "${red}Replacement operation skipped by user.${reset}"
 fi
 }
 
@@ -1265,7 +1306,7 @@ fi
       case "${ans,,}" in
         r)
           echo -e "${cyan}Refreshing keyring...${reset}"
-          sudo pacman -Sy --noconfirm archlinux-keyring manjaro-keyring || true
+          sudo pacman -Syy --noconfirm archlinux-keyring manjaro-keyring || true
           sudo pacman-key --refresh-keys || true
           continue
           ;;
