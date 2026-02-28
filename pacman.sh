@@ -723,7 +723,7 @@ if (( NO_ISSUE_PERCENT < 85 || VOTERS < 200 )); then
   if [[ "${REPLY,,}" == "y" ]]; then
     xdg-open "$FIRST_TOPIC_URL" >/dev/null 2>&1 &
   fi
-  echo -e "\n\n"
+  
 fi
 echo -e "\n\n"
 echo -ne "${yellow}Proceed with the update? (n)o or any other key: ${reset}"
@@ -2113,7 +2113,6 @@ list_flatpaks_with_repo_check() {
             echo "$app"
         fi
     done
-    echo
 }
 
 
@@ -2218,8 +2217,43 @@ print("\n".join(sorted(out, key=lambda s: tuple(map(int,s.split("."))))))
   fi
   if [[ -z "$latest_inst_mm" ]] || \
      [[ "$(printf '%s\n%s\n' "$latest_inst_mm" "$latest_avail_mm" | sort -V | tail -n1)" != "$latest_inst_mm" ]]; then
+    echo
     echo -e "${red}Newer LTS kernel series available: ${orange}${latest_avail_k}${reset} (installed LTS: ${latest_inst_k:-none})"
   fi
 }
 check_newer_manjaro_lts_kernel
- read -r </dev/tty
+
+#Exit message
+press_any_key_to_exit() (
+  exec </dev/tty >/dev/tty 2>/dev/tty || exit 0  # no TTY => don't pause
+
+  local colors=("$cyan" "$red" "$yellow" "$orange" "$green" "$purple" "$blue")
+  local msg="Press any key to Exit"
+  local delay="0.20"
+
+  # Hide cursor; always restore it.
+  printf '\e[?25l'
+  trap 'printf "\e[?25h\e[0m\n"' EXIT
+
+  while :; do
+    local rows cols row col c
+    read -r rows cols < <(stty size 2>/dev/null || echo "24 80")
+
+    row=$(( rows / 2 ))
+    col=$(( (cols - ${#msg}) / 2 ))
+    (( row < 1 )) && row=1
+    (( col < 1 )) && col=1
+
+    for c in "${colors[@]}"; do
+      # Move, print message, clear to end-of-line
+      printf '\e[%d;%dH%b%s%b\e[K' "$row" "$col" "$c" "$msg" "$reset"
+
+      # Any key to exit (with timeout for animation)
+      if IFS= read -rsn1 -t "$delay" _; then
+        exit 0
+      fi
+    done
+  done
+)
+press_any_key_to_exit
+exit 0
