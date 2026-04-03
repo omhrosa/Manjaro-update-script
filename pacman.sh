@@ -717,7 +717,7 @@ prompt_for_db_lock_resolution() {
     esac
   done
 }
-if (( NO_ISSUE_PERCENT < 85 || VOTERS < 200 )); then
+if (( NO_ISSUE_PERCENT < 90 || VOTERS < 200 )); then
   echo -ne "${red}Low 'No issue' percentage or low Voters count. (y)es to open Manjaro topic or any other key to continue: ${reset}"
   read -r REPLY
   if [[ "${REPLY,,}" == "y" ]]; then
@@ -1376,36 +1376,355 @@ fi
 
 
 # Helper function: rebuild_aur_if_needed.
+choose_provider() {
+  local lib="$1"
+  shift
+  local -a providers=("$@")
+
+  (( ${#providers[@]} > 0 )) || return 1
+
+  echo > /dev/tty
+  echo -e "${yellow}Multiple providers found for:${reset} ${orange}${lib}${reset}" > /dev/tty
+
+  local i=1
+  local provider
+  for provider in "${providers[@]}"; do
+    echo " [$i] $provider" > /dev/tty
+    ((i++))
+  done
+  echo " [0] Skip / keep package for rebuild" > /dev/tty
+
+  local choice
+  while true; do
+    echo -ne "${cyan}Choose provider for ${lib}: ${reset}" > /dev/tty
+    read -r choice < /dev/tty
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 0 && choice < i )); then
+      break
+    fi
+
+    echo -e "${red}Invalid choice.${reset}" > /dev/tty
+  done
+
+  (( choice == 0 )) && return 1
+
+  printf '%s\n' "${providers[choice-1]}"
+  return 0
+}
+
 rebuild_aur_if_needed() {
-  echo -e "\n\n"
-  echo -e "${cyan}Checking for packages that need rebuild (rebuild-detector)...${reset}"
-  mapfile -t need_rebuild < <(checkrebuild 2>/dev/null | awk '$1=="foreign"{print $2}' | sort -u)
+  echo -e "\n\n${cyan}Checking for packages that need rebuild (rebuild-detector)...${reset}"
+
+  if [[ -z "${PACMAN_FILES_DB_READY:-}" ]]; then
+    sudo pacman -Fy >/dev/null 2>&1 || true
+    PACMAN_FILES_DB_READY=1
+  fi
+
+  local -a need_rebuild=()
+  mapfile -t need_rebuild < <(
+    checkrebuild 2>/dev/null |
+    awk '$1=="foreign"{print $2}' |
+    sort -u
+  )
+
   if (( ${#need_rebuild[@]} == 0 )); then
     echo -e "${green}No rebuilds needed.${reset}"
     return 0
   fi
-    local -A is_aur=()
+
+  local -A is_aur=()
+  local p
   while read -r p _; do
     [[ -n "$p" ]] && is_aur["$p"]=1
   done < <(pacman -Qm)
-  local -a aur_to_rebuild=()
+
+  local -a candidates=()
   for p in "${need_rebuild[@]}"; do
-    if [[ -n "${is_aur[$p]:-}" ]]; then
-      aur_to_rebuild+=("$p")
-    fi
+    [[ -n "${is_aur[$p]:-}" ]] && candidates+=("$p")
   done
-  if (( ${#aur_to_rebuild[@]} == 0 )); then
-    echo -e "${yellow}Rebuild-detector flagged packages, but none are installed AUR packages. Skipping yay rebuild.${reset}"
-    echo -e "${blue}Flagged:${reset} ${need_rebuild[*]}"
+
+  if (( ${#candidates[@]} == 0 )); then
+    echo -e "${yellow}Flagged but none are installed AUR packages.${reset}"
     return 0
   fi
-  echo -e "${orange}AUR packages to rebuild:${reset} ${aur_to_rebuild[*]}"
+
+  echo -e "${orange}Candidates:${reset} ${candidates[*]}"
+
+  local -a aur_to_rebuild=()
+
+  local -A provider_choice_cache=()
+  local -A repo_candidates_cache=()
+  local -A aur_candidates_cache=()
+
+  local pkg
+  for pkg in "${candidates[@]}"; do
+    echo -e "\n${cyan}Analyzing:${reset} ${pkg}"
+
+    local -a scan_paths=()
+    local -a bins=()
+    local -a missing_libs=()
+    local -a still_missing=()
+
+    mapfile -t scan_paths < <(
+      pacman -Qlq "$pkg" 2>/dev/null |
+      awk '
+        /^\/usr\/bin\// { print; next }
+        /^\/opt\// { print; next }
+        /^\/usr\/lib\/[^/]+\.so(\.[0-9]+)*$/ { print; next }
+        /^\/usr\/lib\/.*\/(plugins?|modules?)\/.*\.so(\.[0-9]+)*$/ { print; next }
+      ' |
+      sort -u
+    )
+
+    local path
+    for path in "${scan_paths[@]}"; do
+      [[ -f "$path" ]] || continue
+      if [[ "$(LC_ALL=C head -c 4 -- "$path" 2>/dev/null)" == $'\x7fELF' ]]; then
+        bins+=("$path")
+      fi
+    done
+
+    if (( ${#bins[@]} == 0 )); then
+      echo -e "${yellow}No ELF binaries found under /usr/bin, /opt, or selected /usr/lib paths → fallback to rebuild${reset}"
+      aur_to_rebuild+=("$pkg")
+      continue
+    fi
+
+    mapfile -t missing_libs < <(
+      for bin in "${bins[@]}"; do
+        ldd "$bin" 2>/dev/null | awk '/not found/ {print $1}'
+      done | sort -u
+    )
+
+    if (( ${#missing_libs[@]} > 0 )); then
+      echo -e "${yellow}Missing libs:${reset} ${missing_libs[*]}"
+
+      local unresolved=false
+      local lib
+
+      local -a repo_to_install=()
+      local -a aur_to_install=()
+      local -A seen_repo=()
+      local -A seen_aur=()
+      local -A provider_cover_count=()
+
+      for lib in "${missing_libs[@]}"; do
+        local -a pre_repo=()
+        local -a pre_aur=()
+
+        if [[ -n "${repo_candidates_cache[$lib]+x}" ]]; then
+          mapfile -t pre_repo < <(printf '%s\n' "${repo_candidates_cache[$lib]}")
+        else
+          mapfile -t pre_repo < <(
+            pacman -Fq -- "$lib" 2>/dev/null | sort -u
+          )
+          repo_candidates_cache["$lib"]="$(printf '%s\n' "${pre_repo[@]}")"
+        fi
+
+        if (( ${#pre_repo[@]} == 0 )); then
+          if [[ -z "${YAY_FILES_DB_READY:-}" ]]; then
+            yay -Fy >/dev/null 2>&1 || true
+            YAY_FILES_DB_READY=1
+          fi
+
+          if [[ -n "${aur_candidates_cache[$lib]+x}" ]]; then
+            mapfile -t pre_aur < <(printf '%s\n' "${aur_candidates_cache[$lib]}")
+          else
+            mapfile -t pre_aur < <(
+              yay -Fq -- "$lib" 2>/dev/null | sort -u
+            )
+            aur_candidates_cache["$lib"]="$(printf '%s\n' "${pre_aur[@]}")"
+          fi
+        fi
+
+        local provider
+        for provider in "${pre_repo[@]}"; do
+          (( provider_cover_count["repo:$provider"]++ ))
+        done
+        for provider in "${pre_aur[@]}"; do
+          (( provider_cover_count["aur:$provider"]++ ))
+        done
+      done
+
+      for lib in "${missing_libs[@]}"; do
+        echo -e "Resolving: ${lib}"
+
+        local -a repo_providers=()
+        local -a aur_providers=()
+        local repo_pkg=""
+        local aur_pkg=""
+        local cache_key=""
+
+        if [[ -n "${repo_candidates_cache[$lib]+x}" ]]; then
+          mapfile -t repo_providers < <(printf '%s\n' "${repo_candidates_cache[$lib]}")
+        else
+          mapfile -t repo_providers < <(
+            pacman -Fq -- "$lib" 2>/dev/null | sort -u
+          )
+          repo_candidates_cache["$lib"]="$(printf '%s\n' "${repo_providers[@]}")"
+        fi
+
+        if (( ${#repo_providers[@]} == 1 )); then
+          repo_pkg="${repo_providers[0]}"
+          [[ -n "${seen_repo[$repo_pkg]:-}" ]] || {
+            repo_to_install+=("$repo_pkg")
+            seen_repo["$repo_pkg"]=1
+          }
+          continue
+        elif (( ${#repo_providers[@]} > 1 )); then
+          mapfile -t repo_providers < <(
+            for provider in "${repo_providers[@]}"; do
+              printf '%08d\t%s\n' "$(( - ${provider_cover_count["repo:$provider"]:-0} ))" "$provider"
+            done | sort -k1,1n -k2,2 | cut -f2-
+          )
+
+          cache_key="repo|$(printf '%s\n' "${repo_providers[@]}" | sort -u | tr '\n' '|')"
+
+          if [[ -n "${provider_choice_cache[$cache_key]+x}" ]]; then
+            repo_pkg="${provider_choice_cache[$cache_key]}"
+            if [[ -n "$repo_pkg" ]]; then
+              [[ -n "${seen_repo[$repo_pkg]:-}" ]] || {
+                repo_to_install+=("$repo_pkg")
+                seen_repo["$repo_pkg"]=1
+              }
+              continue
+            else
+              echo -e "${yellow}Reusing previous skip for repo provider set of ${lib}${reset}"
+              unresolved=true
+              continue
+            fi
+          fi
+
+          if repo_pkg="$(choose_provider "$lib" "${repo_providers[@]}")"; then
+            provider_choice_cache["$cache_key"]="$repo_pkg"
+            [[ -n "${seen_repo[$repo_pkg]:-}" ]] || {
+              repo_to_install+=("$repo_pkg")
+              seen_repo["$repo_pkg"]=1
+            }
+            continue
+          else
+            provider_choice_cache["$cache_key"]=""
+            echo -e "${yellow}Skipped repo provider selection for ${lib}${reset}"
+            unresolved=true
+            continue
+          fi
+        fi
+
+        if [[ -z "${YAY_FILES_DB_READY:-}" ]]; then
+          yay -Fy >/dev/null 2>&1 || true
+          YAY_FILES_DB_READY=1
+        fi
+
+        if [[ -n "${aur_candidates_cache[$lib]+x}" ]]; then
+          mapfile -t aur_providers < <(printf '%s\n' "${aur_candidates_cache[$lib]}")
+        else
+          mapfile -t aur_providers < <(
+            yay -Fq -- "$lib" 2>/dev/null | sort -u
+          )
+          aur_candidates_cache["$lib"]="$(printf '%s\n' "${aur_providers[@]}")"
+        fi
+
+        if (( ${#aur_providers[@]} == 1 )); then
+          aur_pkg="${aur_providers[0]}"
+          [[ -n "${seen_aur[$aur_pkg]:-}" ]] || {
+            aur_to_install+=("$aur_pkg")
+            seen_aur["$aur_pkg"]=1
+          }
+        elif (( ${#aur_providers[@]} > 1 )); then
+          mapfile -t aur_providers < <(
+            for provider in "${aur_providers[@]}"; do
+              printf '%08d\t%s\n' "$(( - ${provider_cover_count["aur:$provider"]:-0} ))" "$provider"
+            done | sort -k1,1n -k2,2 | cut -f2-
+          )
+
+          cache_key="aur|$(printf '%s\n' "${aur_providers[@]}" | sort -u | tr '\n' '|')"
+
+          if [[ -n "${provider_choice_cache[$cache_key]+x}" ]]; then
+            aur_pkg="${provider_choice_cache[$cache_key]}"
+            if [[ -n "$aur_pkg" ]]; then
+              [[ -n "${seen_aur[$aur_pkg]:-}" ]] || {
+                aur_to_install+=("$aur_pkg")
+                seen_aur["$aur_pkg"]=1
+              }
+              continue
+            else
+              echo -e "${yellow}Reusing previous skip for AUR provider set of ${lib}${reset}"
+              unresolved=true
+              continue
+            fi
+          fi
+
+          if aur_pkg="$(choose_provider "$lib" "${aur_providers[@]}")"; then
+            provider_choice_cache["$cache_key"]="$aur_pkg"
+            [[ -n "${seen_aur[$aur_pkg]:-}" ]] || {
+              aur_to_install+=("$aur_pkg")
+              seen_aur["$aur_pkg"]=1
+            }
+          else
+            provider_choice_cache["$cache_key"]=""
+            echo -e "${yellow}Skipped AUR provider selection for ${lib}${reset}"
+            unresolved=true
+          fi
+        else
+          echo -e "${red}No provider found for ${lib}${reset}"
+          unresolved=true
+        fi
+      done
+
+      if (( ${#repo_to_install[@]} > 0 )); then
+        echo -e "${cyan}Installing repo providers:${reset} ${repo_to_install[*]}"
+        prompt_for_db_lock_resolution
+        if ! sudo pacman -S --needed --noconfirm "${repo_to_install[@]}"; then
+          echo -e "${red}Failed to install repo provider set.${reset}"
+          unresolved=true
+        fi
+      fi
+
+      if (( ${#aur_to_install[@]} > 0 )); then
+        echo -e "${cyan}Installing AUR providers:${reset} ${aur_to_install[*]}"
+        if ! yay -S --needed --noconfirm "${aur_to_install[@]}"; then
+          echo -e "${red}Failed to install AUR provider set.${reset}"
+          unresolved=true
+        fi
+      fi
+
+      mapfile -t still_missing < <(
+        for bin in "${bins[@]}"; do
+          ldd "$bin" 2>/dev/null | awk '/not found/ {print $1}'
+        done | sort -u
+      )
+
+      if [[ "$unresolved" == false ]] && (( ${#still_missing[@]} == 0 )); then
+        echo -e "${green}Runtime fixed → skipping rebuild${reset}"
+        continue
+      fi
+
+      if (( ${#still_missing[@]} > 0 )); then
+        echo -e "${red}Still missing after resolution:${reset} ${still_missing[*]}"
+      else
+        echo -e "${yellow}Provider resolution incomplete/ambiguous → keeping rebuild flag${reset}"
+      fi
+
+      aur_to_rebuild+=("$pkg")
+    else
+      echo -e "${blue}No missing libs now → keeping rebuild flag from rebuild-detector${reset}"
+      aur_to_rebuild+=("$pkg")
+    fi
+  done
+
+  if (( ${#aur_to_rebuild[@]} == 0 )); then
+    echo -e "\n${green}No rebuilds required after dependency resolution.${reset}"
+    return 0
+  fi
+
+  echo -e "\n${orange}Rebuilding:${reset} ${aur_to_rebuild[*]}"
+
   if ! run_command yay -S --noconfirm --rebuild --rebuildtree --cleanafter --editmenu=false "${aur_to_rebuild[@]}"; then
-    echo
-    echo -e "${red}AUR rebuild step failed.${reset}"
+    echo -e "${red}Rebuild step failed.${reset}"
     return 1
   fi
-  echo -e "${green}AUR rebuild step completed.${reset}"
+
+  echo -e "${green}Rebuild step completed.${reset}"
   return 0
 }
 # ---- Call site: hard gate updates, then rebuild ----
@@ -1670,21 +1989,85 @@ echo -e "\n\n\n"
 
 # Cleaning unwanted Manjaro Gnome extensions
 echo -e "${cyan}Checking for unwanted Manjaro Gnome extensions...${reset}"
-mapfile -t unwanted_exts < <(find /usr/share/gnome-shell/extensions/ \
-  -mindepth 1 -maxdepth 1 -type d \
-  ! -iname '*pamac*')
+
+mapfile -t unwanted_exts < <(
+  find /usr/share/gnome-shell/extensions/ \
+    -mindepth 1 -maxdepth 1 -type d \
+    ! \( \
+      -name 'argos@pew.worldwidemann.com' -o \
+      -name 'pamac-updates@manjaro.org' -o \
+      -iname '*argos*' -o \
+      -iname '*pamac*' \
+    \)
+)
+
 if [[ ${#unwanted_exts[@]} -eq 0 ]]; then
   echo
-  echo -e "${cyan}No Manjaro Gnome extensions found.${reset}"
+  echo -e "${cyan}No unwanted system Gnome extensions found.${reset}"
 else
   if sudo rm -rf "${unwanted_exts[@]}"; then
     echo
-    echo -e "${green}Manjaro Gnome extensions deleted.${reset}"
+    echo -e "${green}Unwanted system Gnome extensions deleted.${reset}"
   else
     echo
-    echo -e "${red}Failed to delete Manjaro Gnome extensions, continuing...${reset}"
+    echo -e "${red}Failed to delete unwanted system Gnome extensions, continuing...${reset}"
   fi
 fi
+
+echo -e "\n\n\n"
+
+
+
+# Hack for always white pamac icon
+echo -e "${cyan}Checking Pamac extension patch...${reset}"
+
+PAMACFILE='/usr/share/gnome-shell/extensions/pamac-updates@manjaro.org/extension.js'
+PAMACBAK="${PAMACFILE}.pre-gicon.bak"
+ICONDIR="$HOME/.local/share/icons/hicolor/scalable/status"
+PATCHED_NOW=0
+
+mkdir -p "$ICONDIR" >/dev/null 2>&1
+
+[ -f "$ICONDIR/pamac-tray-no-update.svg" ] || \
+  cp -a /usr/share/icons/hicolor/scalable/status/pamac-tray-no-update.svg \
+        "$ICONDIR/" >/dev/null 2>&1
+
+[ -f "$ICONDIR/pamac-tray-update.svg" ] || \
+  cp -a /usr/share/icons/hicolor/scalable/status/pamac-tray-update.svg \
+        "$ICONDIR/" >/dev/null 2>&1
+
+if ! grep -Fq 'this.noUpdateIconFile = Gio.icon_new_for_string' "$PAMACFILE" >/dev/null 2>&1; then
+  sudo rm -f "$PAMACBAK" >/dev/null 2>&1
+  sudo cp -a "$PAMACFILE" "$PAMACBAK" >/dev/null 2>&1
+
+  sudo perl -0pi -e 's@super\._init\(0\.5\);\n@super._init(0.5);\n\n        this.noUpdateIconFile = Gio.icon_new_for_string(GLib.build_filenamev([GLib.get_home_dir(), ".local", "share", "icons", "hicolor", "scalable", "status", "pamac-tray-no-update.svg"]));\n        this.updateIconFile = Gio.icon_new_for_string(GLib.build_filenamev([GLib.get_home_dir(), ".local", "share", "icons", "hicolor", "scalable", "status", "pamac-tray-update.svg"]));\n@sg' \
+  "$PAMACFILE" >/dev/null 2>&1
+
+  sudo perl -0pi -e 's@this\.updateIcon = new St\.Icon\(\{icon_name: "pamac-tray-no-update", style_class: \x27system-status-icon\x27, style: \x27color: white;\x27\}\);@this.updateIcon = new St.Icon({gicon: this.noUpdateIconFile, style_class: \x27system-status-icon\x27});@g; s@this\.updateIcon = new St\.Icon\(\{icon_name: "pamac-tray-no-update", style_class: \x27system-status-icon\x27\}\);@this.updateIcon = new St.Icon({gicon: this.noUpdateIconFile, style_class: \x27system-status-icon\x27});@g' \
+  "$PAMACFILE" >/dev/null 2>&1
+
+  sudo perl -0pi -e 's@this\.updateIcon\.set_icon_name\("pamac-tray-update"\);@this.updateIcon.gicon = this.updateIconFile;@g; s@this\.updateIcon\.set_icon_name\("pamac-tray-no-update"\);@this.updateIcon.gicon = this.noUpdateIconFile;@g' \
+  "$PAMACFILE" >/dev/null 2>&1
+
+  PATCHED_NOW=1
+fi
+
+if grep -Fq 'this.noUpdateIconFile = Gio.icon_new_for_string' "$PAMACFILE" >/dev/null 2>&1 &&
+   grep -Fq 'this.updateIconFile = Gio.icon_new_for_string' "$PAMACFILE" >/dev/null 2>&1 &&
+   grep -Fq "this.updateIcon = new St.Icon({gicon: this.noUpdateIconFile, style_class: 'system-status-icon'});" "$PAMACFILE" >/dev/null 2>&1 &&
+   grep -Fq 'this.updateIcon.gicon = this.updateIconFile;' "$PAMACFILE" >/dev/null 2>&1 &&
+   grep -Fq 'this.updateIcon.gicon = this.noUpdateIconFile;' "$PAMACFILE" >/dev/null 2>&1; then
+  echo
+  if [[ $PATCHED_NOW -eq 1 ]]; then
+    echo -e "${green}Pamac extension patched!!${reset}"
+  else
+    echo -e "${cyan}Pamac extension still ok.${reset}"
+  fi
+else
+  echo
+  echo -e "${red}Pamac extension patch failed.${reset}"
+fi
+
 echo -e "\n\n\n"
 
 
