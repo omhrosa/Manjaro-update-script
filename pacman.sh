@@ -627,15 +627,20 @@ echo -e "No issue: ${orange}${PERCENT_TEXT}${reset}%  Total votes: ${VOTERS:-0}"
 echo
 echo
 echo
+gnome_version_before="$(gnome-shell --version | awk '{print $3}')"
+
 aur_count=$(pacman -Qm | wc -l)
 extensions_count=$(gext list | wc -l)
 flatpak_count=$(flatpak list --app --columns=application 2> /dev/null | wc -l)
-echo -e "${reset}Aur: ${orange}${aur_count}${reset}  Extensions: ${orange}${extensions_count}${reset}  Flatpaks: ${flatpak_count}"
+
 read total used avail <<< $(df / --block-size=1 | awk 'NR==2 {print $2, $3, $4}')
 percent=$(awk -v u="$used" -v t="$total" 'BEGIN { printf "%.1f", (u/t)*100 }')
 used_gb=$(awk -v u="$used" 'BEGIN { printf "%.1f", u/1e9 }')
 explicit_count=$(pacman -Qe | wc -l)
+
+echo -e "${reset}Aur: ${orange}${aur_count}${reset}  Extensions: ${orange}${extensions_count}${reset}  Flatpaks: ${flatpak_count}"
 echo -e "${reset}Disk used: ${orange}${used_gb}${reset}GB (${percent}% full)  Programs: ${explicit_count}"
+echo -e "${reset}GNOME: ${orange}${gnome_version_before}${reset}"
 
 # Run a command with consistent logging and error handling.
 # Shows status, captures failures, and preserves exit codes.
@@ -693,7 +698,8 @@ prompt_for_db_lock_resolution() {
         esac
     done
 }
-if ((NO_ISSUE_PERCENT < 90 || VOTERS < 200)); then
+if ((NO_ISSUE_PERCENT < 88 || VOTERS < 100)); then
+    echo -e "\n\n"
     echo -ne "${red}Low 'No issue' percentage or low Voters count. (y)es to open Manjaro topic or any other key to continue: ${reset}"
     read -r REPLY
     if [[ "${REPLY,,}" == "y" ]]; then
@@ -1321,7 +1327,7 @@ perform_updates() {
     # ---- Yay update (best effort) ----
     prompt_for_db_lock_resolution
     while true; do
-        if run_command yay -Syu --devel --timeupdate --noconfirm --cleanafter --editmenu=false --combinedupgrade; then
+        if run_command yay -Syu --devel --noconfirm --cleanafter --editmenu=false --combinedupgrade; then
             break
         fi
         echo
@@ -1378,7 +1384,7 @@ choose_provider() {
 }
 
 rebuild_aur_if_needed() {
-    echo -e "\n\n${cyan}Checking for packages that need rebuild (rebuild-detector)...${reset}"
+    echo -e "\n\n\n${cyan}Checking for packages that need rebuild (rebuild-detector)...${reset}"
 
     if [[ -z "${PACMAN_FILES_DB_READY:-}" ]]; then
         sudo pacman -Fy > /dev/null 2>&1 || true
@@ -1718,6 +1724,48 @@ if ! run_command flatpak update -y; then
     echo -e "${red}Flatpak update (user) failed, continuing...${reset}"
 fi
 
+
+echo -e "\n\n\n"
+
+echo -e "${cyan}Running: topgrade${reset}"
+
+if command -v topgrade >/dev/null; then
+    # 1. Force refresh firmware DB
+    sudo fwupdmgr refresh --force >/dev/null 2>&1
+
+    # 2. Topgrade AUTO για όλα εκτός firmware
+    if ! topgrade \
+        --yes \
+        --disable firmware config_update \
+        --notify-end never \
+        | sed 's/^/[topgrade] /'; then
+        echo -e "${yellow}Topgrade reported errors, continuing...${reset}"
+    fi
+
+    echo
+
+    # 3. Firmware interactive (μόνο αν υπάρχουν updates)
+    fw_updates=$(sudo fwupdmgr get-updates 2>/dev/null)
+
+    if echo "$fw_updates" | grep -q "Devices with no available firmware updates"; then
+        echo -e "${green}No firmware updates available${reset}"
+    else
+        echo -e "${cyan}Running: firmware updates${reset}"
+        echo "$fw_updates"
+        sudo fwupdmgr update
+    fi
+
+    echo
+    echo -e "${cyan}Post-Topgrade consistency check...${reset}"
+
+    if ! rebuild_aur_if_needed; then
+        echo -e "${yellow}Post-Topgrade rebuild check failed, continuing...${reset}"
+    fi
+else
+    echo -e "${yellow}Topgrade not installed, skipping...${reset}"
+fi
+
+
 ((++current_step))
 show_progress $current_step $total_steps
 echo -e "\n\n\n\n${purple}$(printf '%*s' 49 '' | tr ' ' '-') Cleanup-Repairs $(printf '%*s' 49 '' | tr ' ' '-')${reset}"
@@ -1965,58 +2013,6 @@ else
         echo
         echo -e "${red}Failed to delete unwanted system Gnome extensions, continuing...${reset}"
     fi
-fi
-
-echo -e "\n\n\n"
-
-# Hack for always white pamac icon
-echo -e "${cyan}Checking Pamac extension patch...${reset}"
-
-PAMACFILE='/usr/share/gnome-shell/extensions/pamac-updates@manjaro.org/extension.js'
-PAMACBAK="${PAMACFILE}.pre-gicon.bak"
-ICONDIR="$HOME/.local/share/icons/hicolor/scalable/status"
-PATCHED_NOW=0
-
-mkdir -p "$ICONDIR" > /dev/null 2>&1
-
-[ -f "$ICONDIR/pamac-tray-no-update.svg" ] \
-    || cp -a /usr/share/icons/hicolor/scalable/status/pamac-tray-no-update.svg \
-        "$ICONDIR/" > /dev/null 2>&1
-
-[ -f "$ICONDIR/pamac-tray-update.svg" ] \
-    || cp -a /usr/share/icons/hicolor/scalable/status/pamac-tray-update.svg \
-        "$ICONDIR/" > /dev/null 2>&1
-
-if ! grep -Fq 'this.noUpdateIconFile = Gio.icon_new_for_string' "$PAMACFILE" > /dev/null 2>&1; then
-    sudo rm -f "$PAMACBAK" > /dev/null 2>&1
-    sudo cp -a "$PAMACFILE" "$PAMACBAK" > /dev/null 2>&1
-
-    sudo perl -0pi -e 's@super\._init\(0\.5\);\n@super._init(0.5);\n\n        this.noUpdateIconFile = Gio.icon_new_for_string(GLib.build_filenamev([GLib.get_home_dir(), ".local", "share", "icons", "hicolor", "scalable", "status", "pamac-tray-no-update.svg"]));\n        this.updateIconFile = Gio.icon_new_for_string(GLib.build_filenamev([GLib.get_home_dir(), ".local", "share", "icons", "hicolor", "scalable", "status", "pamac-tray-update.svg"]));\n@sg' \
-        "$PAMACFILE" > /dev/null 2>&1
-
-    sudo perl -0pi -e 's@this\.updateIcon = new St\.Icon\(\{icon_name: "pamac-tray-no-update", style_class: \x27system-status-icon\x27, style: \x27color: white;\x27\}\);@this.updateIcon = new St.Icon({gicon: this.noUpdateIconFile, style_class: \x27system-status-icon\x27});@g; s@this\.updateIcon = new St\.Icon\(\{icon_name: "pamac-tray-no-update", style_class: \x27system-status-icon\x27\}\);@this.updateIcon = new St.Icon({gicon: this.noUpdateIconFile, style_class: \x27system-status-icon\x27});@g' \
-        "$PAMACFILE" > /dev/null 2>&1
-
-    sudo perl -0pi -e 's@this\.updateIcon\.set_icon_name\("pamac-tray-update"\);@this.updateIcon.gicon = this.updateIconFile;@g; s@this\.updateIcon\.set_icon_name\("pamac-tray-no-update"\);@this.updateIcon.gicon = this.noUpdateIconFile;@g' \
-        "$PAMACFILE" > /dev/null 2>&1
-
-    PATCHED_NOW=1
-fi
-
-if grep -Fq 'this.noUpdateIconFile = Gio.icon_new_for_string' "$PAMACFILE" > /dev/null 2>&1 \
-    && grep -Fq 'this.updateIconFile = Gio.icon_new_for_string' "$PAMACFILE" > /dev/null 2>&1 \
-    && grep -Fq "this.updateIcon = new St.Icon({gicon: this.noUpdateIconFile, style_class: 'system-status-icon'});" "$PAMACFILE" > /dev/null 2>&1 \
-    && grep -Fq 'this.updateIcon.gicon = this.updateIconFile;' "$PAMACFILE" > /dev/null 2>&1 \
-    && grep -Fq 'this.updateIcon.gicon = this.noUpdateIconFile;' "$PAMACFILE" > /dev/null 2>&1; then
-    echo
-    if [[ $PATCHED_NOW -eq 1 ]]; then
-        echo -e "${green}Pamac extension patched!!${reset}"
-    else
-        echo -e "${cyan}Pamac extension still ok.${reset}"
-    fi
-else
-    echo
-    echo -e "${red}Pamac extension patch failed.${reset}"
 fi
 
 echo -e "\n\n\n"
@@ -2396,14 +2392,21 @@ echo -e "\n\n\n\n${purple}$(printf '%*s' 55 '' | tr ' ' '-') End $(printf '%*s' 
 echo -e "\n\n\n"
 
 # Stats after updates
+gnome_version_after="$(gnome-shell --version | awk '{print $3}')"
+
 explicit_count2=$(pacman -Qe | wc -l)
 read total used avail <<< $(df / --block-size=1 | awk 'NR==2 {print $2, $3, $4}')
-percent=$(awk -v u="$used" -v t="$total" 'BEGIN { printf "%.1f", (u/t)*100 }')
 used_gb2=$(awk -v u="$used" 'BEGIN { printf "%.1f", u/1e9 }')
+
 explicit_diff=$((explicit_count2 - explicit_count))
 used_diff=$(awk -v u1="$used_gb2" -v u2="$used_gb" 'BEGIN { d = u1 - u2; printf "%+.1f", d }')
+
 echo -e "${reset}Disk used: ${used_gb2}GB${reset}  diff: ${orange}${used_diff}${reset}GB"
 echo -e "${reset}Programs: ${explicit_count2}${reset}  diff: ${orange}${explicit_diff}${reset}"
+
+if [[ "$gnome_version_before" != "$gnome_version_after" ]]; then
+    echo -e "${reset}GNOME version: ${orange}${gnome_version_before}${reset} -> ${orange}${gnome_version_after}${reset}"
+fi
 echo
 
 # Helper function: list_flatpaks_with_repo_check.
