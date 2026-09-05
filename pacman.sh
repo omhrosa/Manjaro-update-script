@@ -73,7 +73,10 @@ echo -e "\n\n"
 echo -ne "${yellow}"
 
 # Prompt for sudo once and validate privileges.
-sudo -v
+if ! sudo -v; then
+    echo -e "${red}Error: sudo authentication failed. Exiting.${reset}"
+    exit 1
+fi
 
 # Handle cleanup and log finalization on exit or interruption.
 # Stops sudo keepalive, cleans tmp logs, and restores stdio.
@@ -187,7 +190,7 @@ deps_check_and_install() {
     # Commands used by the script (explicitly checked)
     for cmd in \
         pacman-mirrors curl smartctl snapper grub-mkconfig flatpak yay gext checkrebuild fuser \
-        python3 timedatectl findmnt lsblk realpath script mhwd-kernel meld gnome-text-editor xdg-open \
+        python3 timedatectl findmnt lsblk realpath script flock mhwd-kernel meld gnome-text-editor xdg-open \
         awk sed tr find grep sort comm stat df; do
         command -v "$cmd" > /dev/null 2>&1 || missing_cmds+=("$cmd")
     done
@@ -214,7 +217,7 @@ deps_check_and_install() {
             python3) repo_pkgs+=(python) ;;
             timedatectl) repo_pkgs+=(systemd) ;;
 
-            findmnt | lsblk | script) repo_pkgs+=(util-linux) ;;
+            findmnt | lsblk | script | flock) repo_pkgs+=(util-linux) ;;
             mhwd-kernel) repo_pkgs+=(mhwd) ;;
             xdg-open) repo_pkgs+=(xdg-utils) ;;
             meld) repo_pkgs+=(meld) ;;
@@ -275,6 +278,17 @@ deps_check_and_install() {
 }
 deps_check_and_install || exit 1
 
+# Prevent two copies of this maintenance script from running at the same time.
+UPDATE_LOCK="${XDG_RUNTIME_DIR:-/tmp}/manjaro-update-${UID}.lock"
+exec 9>"$UPDATE_LOCK" || {
+    echo -e "${red}Error: could not open update lock file: $UPDATE_LOCK${reset}"
+    exit 1
+}
+if ! flock -n 9; then
+    echo -e "${red}Another instance of the update script is already running. Exiting.${reset}"
+    exit 1
+fi
+
 echo -ne "${reset}"
 clear
 progress_ui_init
@@ -291,24 +305,30 @@ log_file="Update-${datetime_str}.log"
 log_path="${log_dir}${log_file}"
 exec > >(tee -a "$log_path") 2>&1
 
-# Report how long it has been since the last successful run.
-# Uses the newest Update-*.log timestamp as the reference.
-log_file=$(find "$HOME" -maxdepth 1 -type f -name 'Update-*.log' -printf '%T@ %p\n' 2> /dev/null | sort -nr | awk 'NR==1 {print $2}')
-if [[ -f "$log_file" ]]; then
-    file_time=$(stat -c %Y "$log_file")
-    now_time=$(date +%s)
-    seconds_diff=$((now_time - file_time))
-    days=$((seconds_diff / 86400))
-    hours=$(((seconds_diff % 86400) / 3600))
-    echo -e "${blue}Time since last update: ${orange}${days}${reset} days and ${orange}${hours}${reset} hours"
+# Report how long it has been since the last successful update stage.
+# This timestamp is written only after perform_updates completes successfully.
+SUCCESS_STAMP="$HOME/.manjaro_update_last_success"
+if [[ -f "$SUCCESS_STAMP" ]]; then
+    last_success_epoch="$(cat "$SUCCESS_STAMP" 2> /dev/null)"
+    if [[ "$last_success_epoch" =~ ^[0-9]+$ ]]; then
+        now_time=$(date +%s)
+        seconds_diff=$((now_time - last_success_epoch))
+        ((seconds_diff < 0)) && seconds_diff=0
+        days=$((seconds_diff / 86400))
+        hours=$(((seconds_diff % 86400) / 3600))
+        echo -e "${blue}Time since last successful update: ${orange}${days}${reset} days and ${orange}${hours}${reset} hours"
+    else
+        echo -e "${red}Last successful update timestamp is invalid.${reset}"
+    fi
 else
-    echo -e "${red}No update logs found.${reset}"
+    echo -e "${red}No successful update timestamp found yet.${reset}"
 fi
 echo
 echo
 
 # Gate the run on basic NVMe SMART health.
-# Avoids performing upgrades when storage is already unhealthy.
+# smartctl uses a bitmask exit status: bits 0-2 are command/device-access failures,
+# while higher bits can report SMART findings even when the command itself succeeded.
 echo -e "\n${orange}Checking NVMe SMART health...${reset}"
 root_src="$(findmnt -n -o SOURCE / 2> /dev/null)"
 root_src="${root_src%%[*}"
@@ -331,110 +351,166 @@ if [[ "$SMART_DEV" =~ ^/dev/nvme[0-9]+n[0-9]+p[0-9]+$ ]]; then
 fi
 echo
 echo -e "Device: ${blue}${SMART_DEV}${reset}"
+
 while true; do
-    out="$(sudo smartctl -a "$SMART_DEV" 2> /dev/null)"
+    smart_err="/tmp/manjaro/smartctl.err"
+    : > "$smart_err"
+    out="$(sudo smartctl -a -j "$SMART_DEV" 2> "$smart_err")"
     st=$?
-    if ((st == 0)); then
+
+    # smartctl bits 0-2 mean the command/device access itself failed.
+    if (((st & 7) != 0)); then
+        echo -e "\n${red}Error: smartctl could not reliably read ${SMART_DEV} (exit ${st}).${reset}"
+        [[ -s "$smart_err" ]] && cat "$smart_err"
+        while true; do
+            echo
+            echo -ne "${yellow}(r)etry SMART check or (e)xit script: ${reset}"
+            read -r choice
+            echo
+            case "${choice,,}" in
+                r) break ;;
+                e)
+                    echo -e "${red}Exiting script...${reset}"
+                    exit 1
+                    ;;
+                *)
+                    echo -e "${red}Please answer with (r)etry or (e)xit.${reset}"
+                    ;;
+            esac
+        done
+        continue
+    fi
+
+    parsed="$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+nv = d.get("nvme_smart_health_information_log")
+if not isinstance(nv, dict):
+    raise SystemExit(2)
+crit = nv.get("critical_warning")
+if isinstance(crit, int):
+    crit = f"0x{crit:02x}"
+elif crit is None:
+    crit = "NA"
+else:
+    crit = str(crit)
+passed = d.get("smart_status", {}).get("passed")
+passed = "yes" if passed is True else "no" if passed is False else "NA"
+def v(name):
+    x = nv.get(name)
+    return "NA" if x is None else str(x)
+print("|".join([crit, v("temperature"), v("available_spare"),
+                v("available_spare_threshold"), v("percentage_used"),
+                v("media_errors"), v("num_err_log_entries"), passed]))
+')"
+    parse_status=$?
+
+    if ((parse_status != 0)); then
+        echo -e "\n${red}Error: could not parse smartctl JSON output for ${SMART_DEV}.${reset}"
+        while true; do
+            echo
+            echo -ne "${yellow}(r)etry SMART check or (e)xit script: ${reset}"
+            read -r choice
+            echo
+            case "${choice,,}" in
+                r) break ;;
+                e)
+                    echo -e "${red}Exiting script...${reset}"
+                    exit 1
+                    ;;
+                *)
+                    echo -e "${red}Please answer with (r)etry or (e)xit.${reset}"
+                    ;;
+            esac
+        done
+        continue
+    fi
+
+    IFS='|' read -r crit temp spare thresh used media_err err_log smart_passed <<< "$parsed"
+    health_ok=true
+    health_warn=false
+
+    if [[ "$smart_passed" == "no" ]]; then
+        health_ok=false
+    fi
+    if [[ "$spare" != "NA" && "$thresh" != "NA" ]] && ((spare < thresh)); then
+        health_ok=false
+    fi
+    if [[ "$crit" == "NA" || "$crit" != "0x00" ]]; then
+        health_warn=true
+    fi
+    if [[ "$media_err" != "NA" ]] && ((media_err > 0)); then
+        health_warn=true
+    fi
+
+    {
+        echo "SMART full stats:"
+        echo "smartctl exit status: $st"
+        echo "SMART overall passed: $smart_passed"
+        echo "Critical Warning: $crit"
+        echo "Temperature: $temp C"
+        echo "Available Spare: $spare%  Threshold: $thresh%"
+        echo "Percentage Used: $used%"
+        echo "Media/Data Integrity Errors: $media_err"
+        echo "Error Log Entries: $err_log"
+        echo
+    } >> "$log_path"
+
+    if [[ "$health_ok" == false ]]; then
+        echo -e "\n${red}SMART health looks BAD.${reset}"
+        echo
+        echo -e "SMART overall passed:${reset} ${orange}${smart_passed}${reset}"
+        echo -e "Critical Warning:${reset} ${orange}${crit}${reset}"
+        echo -e "Temperature:${reset} ${orange}${temp}${reset} C"
+        echo -e "Available Spare:${reset} ${orange}${spare}${reset}%  Threshold:${reset} ${orange}${thresh}${reset}%"
+        echo -e "Percentage Used:${reset} ${orange}${used}${reset}%"
+        echo -e "Media/Data Integrity Errors:${reset} ${orange}${media_err}${reset}"
+        echo -e "Error Log Entries:${reset} ${orange}${err_log}${reset}"
+        while true; do
+            echo
+            echo -ne "${yellow}(r)etry SMART check or (e)xit script: ${reset}"
+            read -r choice
+            echo
+            case "${choice,,}" in
+                r) break ;;
+                e)
+                    echo -e "${red}Exiting script...${reset}"
+                    exit 1
+                    ;;
+                *)
+                    echo -e "${red}Please answer with (r)etry or (e)xit.${reset}"
+                    ;;
+            esac
+        done
+        continue
+    fi
+
+    if [[ "$health_warn" == true ]]; then
+        echo -e "\n${yellow}SMART reports warnings. Backups recommended.${reset}"
+        echo
+        echo -e "SMART overall passed:${reset} ${orange}${smart_passed}${reset}"
+        echo -e "Critical Warning:${reset} ${orange}${crit}${reset}"
+        echo -e "Temperature:${reset} ${orange}${temp}${reset} C"
+        echo -e "Available Spare:${reset} ${orange}${spare}${reset}%  Threshold:${reset} ${orange}${thresh}${reset}%"
+        echo -e "Percentage Used:${reset} ${orange}${used}${reset}%"
+        echo -e "Media/Data Integrity Errors:${reset} ${orange}${media_err}${reset}"
+        echo -e "Error Log Entries:${reset} ${orange}${err_log}${reset}"
+        echo -ne "${yellow}Proceed anyway? (y)es or (e)xit script: ${reset}"
+        read -r go
+        echo
+        if [[ "${go,,}" != "y" ]]; then
+            echo -e "${red}Exiting script...${reset}"
+            exit 1
+        fi
         break
     fi
-    echo -e "\n${red}Error: smartctl failed on ${SMART_DEV}.${reset}"
-    while true; do
-        echo
-        echo -ne "${yellow}(r)etry SMART check or (e)xit script: ${reset}"
-        read -r choice
-        echo
-        case "${choice,,}" in
-            r) break ;;
-            e)
-                echo -e "${red}Exiting script...${reset}"
-                exit 1
-                ;;
-            *)
-                echo -e "${red}Please answer with (r)etry or (e)xit.${reset}"
-                ;;
-        esac
-    done
-done
-crit="$(printf '%s\n' "$out" | grep -m1 -oP 'Critical Warning:\s*\K0x[0-9a-fA-F]+' || true)"
-temp="$(printf '%s\n' "$out" | grep -m1 -oP 'Temperature:\s*\K[0-9]+' || true)"
-spare="$(printf '%s\n' "$out" | grep -m1 -oP 'Available Spare:\s*\K[0-9]+' || true)"
-thresh="$(printf '%s\n' "$out" | grep -m1 -oP 'Available Spare Threshold:\s*\K[0-9]+' || true)"
-used="$(printf '%s\n' "$out" | grep -m1 -oP 'Percentage Used:\s*\K[0-9]+' || true)"
-media_err="$(printf '%s\n' "$out" | grep -m1 -oP 'Media and Data Integrity Errors:\s*\K[0-9]+' || true)"
-err_log="$(printf '%s\n' "$out" | grep -m1 -oP 'Error Information Log Entries:\s*\K[0-9]+' || true)"
-crit="${crit:-0x00}"
-temp="${temp:-NA}"
-spare="${spare:-NA}"
-thresh="${thresh:-NA}"
-used="${used:-NA}"
-media_err="${media_err:-NA}"
-err_log="${err_log:-NA}"
-health_ok=true
-health_warn=false
-if [[ "$spare" != "NA" && "$thresh" != "NA" ]] && ((spare < thresh)); then
-    health_ok=false
-fi
-if [[ "$crit" != "0x00" ]]; then
-    health_warn=true
-fi
-if [[ "$media_err" != "NA" ]] && ((media_err > 0)); then
-    health_warn=true
-fi
-{
-    echo "SMART full stats:"
-    echo "Critical Warning: $crit"
-    echo "Temperature: $temp C"
-    echo "Available Spare: $spare%  Threshold: $thresh%"
-    echo "Percentage Used: $used%"
-    echo "Media/Data Integrity Errors: $media_err"
-    echo "Error Log Entries: $err_log"
-    echo
-} >> "$log_path"
-if [[ "$health_ok" == false ]]; then
-    echo -e "\n${red}SMART health looks BAD (Available Spare below threshold).${reset}"
-    echo
-    echo -e "Critical Warning:${reset} ${orange}${crit}${reset}"
-    echo -e "Temperature:${reset} ${orange}${temp}${reset} C"
-    echo -e "Available Spare:${reset} ${orange}${spare}${reset}%  Threshold:${reset} ${orange}${thresh}${reset}%"
-    echo -e "Percentage Used:${reset} ${orange}${used}${reset}%"
-    echo -e "Media/Data Integrity Errors:${reset} ${orange}${media_err}${reset}"
-    echo -e "Error Log Entries:${reset} ${orange}${err_log}${reset}"
-    while true; do
-        echo
-        echo -ne "${yellow}(r)etry SMART check or (e)xit script: ${reset}"
-        read -r choice
-        echo
-        case "${choice,,}" in
-            r) break ;;
-            e)
-                echo -e "${red}Exiting script...${reset}"
-                exit 1
-                ;;
-            *)
-                echo -e "${red}Please answer with (r)etry or (e)xit.${reset}"
-                ;;
-        esac
-    done
-fi
-if [[ "$health_warn" == true ]]; then
-    echo -e "\n${yellow}SMART reports warnings. Backups recommended.${reset}"
-    echo
-    echo -e "Critical Warning:${reset} ${orange}${crit}${reset}"
-    echo -e "Temperature:${reset} ${orange}${temp}${reset} C"
-    echo -e "Available Spare:${reset} ${orange}${spare}${reset}%  Threshold:${reset} ${orange}${thresh}${reset}%"
-    echo -e "Percentage Used:${reset} ${orange}${used}${reset}%"
-    echo -e "Media/Data Integrity Errors:${reset} ${orange}${media_err}${reset}"
-    echo -e "Error Log Entries:${reset} ${orange}${err_log}${reset}"
-    echo -ne "${yellow}Proceed anyway? (y)es or (e)xit script: ${reset}"
-    read -r go
-    echo
-    if [[ "${go,,}" != "y" ]]; then
-        echo -e "${red}Exiting script...${reset}"
-        exit 1
-    fi
-else
+
     echo -e "\n${green}SMART OK (temp ${temp}C, used ${used}%)${reset}"
-fi
+    break
+done
 echo -e "\n"
 echo -e "\n${orange}Checking for btrfs snapshots...${reset}"
 if [[ ! -d "/.snapshots" ]]; then
@@ -453,51 +529,64 @@ SNAPPER_CONFIG="$(
 SNAPPER_CONFIG="${SNAPPER_CONFIG:-root}"
 cutoff_epoch="$(date -d '7 days ago' +%s)"
 
-# Helper function: get_recent_snapshots_sorted.
-get_recent_snapshots_sorted() {
+# Helper function: load all snapshots, sorted from newest to oldest.
+# Interactive retry/exit handling stays in the main shell.
+get_snapshots_sorted() {
     local out
-    while true; do
-        out="$(sudo snapper -c "$SNAPPER_CONFIG" --csvout --separator '|' --no-headers list --columns number,date,description 2> /dev/null)"
-        local status=$?
-        if ((status == 0)); then
-            break
-        fi
-        echo -e "\n${red}Error: snapper list failed (config: ${SNAPPER_CONFIG}).${reset}"
-        while true; do
-            echo
-            echo -ne "${yellow}(r)etry or (e)xit script: ${reset}"
-            read -r choice
-            echo
-            case "${choice,,}" in
-                r) break ;;
-                e)
-                    echo -e "${red}Exiting script...${reset}"
-                    exit 1
-                    ;;
-                *)
-                    echo -e "${red}Please answer with (r)etry or (e)xit.${reset}"
-                    ;;
-            esac
-        done
-    done
-    printf '%s\n' "$out" \
-        | awk -F'|' '$1 ~ /^[0-9]+$/ && $1 != "0" {print $1 "|" $2 "|" $3}' \
-        | while IFS='|' read -r num sdate desc; do
-            local snap_epoch
-            snap_epoch="$(date -d "$sdate" +%s 2> /dev/null || echo 0)"
-            if ((snap_epoch >= cutoff_epoch)); then
+    out="$(sudo snapper -c "$SNAPPER_CONFIG" --csvout --separator '|' --no-headers list --columns number,date,description 2> /dev/null)" || return 1
+
+    mapfile -t all_snapshot_lines < <(
+        printf '%s\n' "$out" \
+            | awk -F'|' '$1 ~ /^[0-9]+$/ && $1 != "0" {print $1 "|" $2 "|" $3}' \
+            | while IFS='|' read -r num sdate desc; do
+                snap_epoch="$(date -d "$sdate" +%s 2> /dev/null || echo 0)"
                 printf '%s|%s|%s|%s\n' "$snap_epoch" "$num" "$sdate" "$desc"
-            fi
-        done \
-        | sort -nr
+            done \
+            | sort -nr
+    )
+    return 0
 }
-mapfile -t recent_lines < <(get_recent_snapshots_sorted)
-if ((${#recent_lines[@]} > 0)); then
-    echo -e "\n${green}Found Btrfs snapshot 7 days or newer, continuing...${reset}"
-    for line in "${recent_lines[@]}"; do
+
+while true; do
+    if get_snapshots_sorted; then
+        break
+    fi
+
+    echo -e "\n${red}Error: snapper list failed (config: ${SNAPPER_CONFIG}).${reset}"
+    while true; do
+        echo
+        echo -ne "${yellow}(r)etry or (e)xit script: ${reset}"
+        read -r choice
+        echo
+        case "${choice,,}" in
+            r) break ;;
+            e)
+                echo -e "${red}Exiting script...${reset}"
+                exit 1
+                ;;
+            *)
+                echo -e "${red}Please answer with (r)etry or (e)xit.${reset}"
+                ;;
+        esac
+    done
+done
+
+recent_snapshot_found=false
+if ((${#all_snapshot_lines[@]} > 0)); then
+    echo -e "\n${cyan}All Btrfs snapshots (newest to oldest):${reset}"
+    for line in "${all_snapshot_lines[@]}"; do
         IFS='|' read -r epoch num sdate desc <<< "$line"
         echo -e "${reset}${num}${reset}  ${sdate}  ${desc}"
+        if ((epoch >= cutoff_epoch)); then
+            recent_snapshot_found=true
+        fi
     done
+else
+    echo -e "\n${yellow}No Btrfs snapshots found.${reset}"
+fi
+
+if [[ "$recent_snapshot_found" == true ]]; then
+    echo -e "\n${green}Found Btrfs snapshot 7 days or newer, continuing...${reset}"
     echo -e "\n\n"
 else
     echo -e "\n${yellow}No snapshots found from the last 7 days.${reset}"
@@ -627,7 +716,7 @@ echo -e "No issue: ${orange}${PERCENT_TEXT}${reset}%  Total votes: ${VOTERS:-0}"
 echo
 echo
 echo
-gnome_version_before="$(gnome-shell --version | awk '{print $3}')"
+gnome_version_before="$(pacman -Q gnome-shell | awk '{print $2}' | cut -d- -f1)"
 
 aur_count=$(pacman -Qm | wc -l)
 extensions_count=$(gext list | wc -l)
@@ -852,7 +941,7 @@ replace_aur_with_repo() {
 
     if [[ ! -f /tmp/manjaro/repo_pkgs.txt ]]; then
         echo -e "${red}Repo package list file /tmp/manjaro/repo_pkgs.txt not found! Run pacman -Sl to generate it.${reset}"
-        return 1
+        return 0
     fi
 
     mapfile -t repo_pkgs < "/tmp/manjaro/repo_pkgs.txt"
@@ -985,6 +1074,7 @@ replace_aur_with_repo() {
     read -r choice < /dev/tty
 
     if [[ "$choice" =~ ^[Yy]$ ]]; then
+        local failed_count=0
         for entry in "${valid_replace[@]}"; do
             local aur="${entry%%|*}"
             local base="${entry##*|}"
@@ -992,6 +1082,7 @@ replace_aur_with_repo() {
             echo -e "${cyan}Removing AUR package: $aur...${reset}"
             if ! run_command yay -Rns --noconfirm "$aur"; then
                 echo -e "${red}Failed to remove $aur. Skipping this package.${reset}"
+                ((failed_count++))
                 continue
             fi
 
@@ -999,7 +1090,12 @@ replace_aur_with_repo() {
             prompt_for_db_lock_resolution
             if ! run_command sudo pacman -S --noconfirm "$base"; then
                 echo -e "${red}Failed to install $base. Attempting to reinstall $aur...${reset}"
-                run_command yay -S --noconfirm "$aur"
+                ((failed_count++))
+                if ! run_command yay -S --noconfirm "$aur"; then
+                    echo -e "${red}ROLLBACK FAILED: $aur could not be restored. Stopping the update stage.${reset}"
+                    return 1
+                fi
+                echo -e "${yellow}Rollback successful: $aur was restored.${reset}"
                 continue
             fi
 
@@ -1007,11 +1103,16 @@ replace_aur_with_repo() {
         done
 
         echo
-        echo -e "${green}All replacements completed.${reset}"
+        if ((failed_count == 0)); then
+            echo -e "${green}All replacements completed.${reset}"
+        else
+            echo -e "${yellow}Replacement pass completed with ${failed_count} package(s) left unchanged/restored.${reset}"
+        fi
     else
         echo
         echo -e "${red}Replacement operation skipped by user.${reset}"
     fi
+    return 0
 }
 
 # Helper function: replace_flatpaks_with_repo.
@@ -1037,7 +1138,7 @@ replace_flatpaks_with_repo() {
 
     if [[ ! -f /tmp/manjaro/repo_pkgs.txt ]]; then
         echo -e "${red}Repo package list file /tmp/manjaro/repo_pkgs.txt not found! Run pacman -Sl to generate it.${reset}"
-        return 1
+        return 0
     fi
 
     mapfile -t repo_pkgs < "/tmp/manjaro/repo_pkgs.txt"
@@ -1194,6 +1295,7 @@ replace_flatpaks_with_repo() {
     read -r choice < /dev/tty
 
     if [[ "$choice" =~ ^[Yy]$ ]]; then
+        local failed_count=0
         for entry in "${valid_replace[@]}"; do
             appid="$(cut -d'|' -f1 <<< "$entry")"
             origin="$(cut -d'|' -f2 <<< "$entry")"
@@ -1202,28 +1304,49 @@ replace_flatpaks_with_repo() {
 
             echo -e "${cyan}Removing Flatpak app: $appid...${reset}"
             if [[ "$install" == "user" ]]; then
-                run_command flatpak uninstall -y --user "$appid" || continue
+                if ! run_command flatpak uninstall -y --user "$appid"; then
+                    ((failed_count++))
+                    continue
+                fi
             else
-                run_command sudo flatpak uninstall -y --system "$appid" || continue
+                if ! run_command sudo flatpak uninstall -y --system "$appid"; then
+                    ((failed_count++))
+                    continue
+                fi
             fi
 
             echo -e "${cyan}Installing repo package: $repo_pkg...${reset}"
             prompt_for_db_lock_resolution
             if ! run_command sudo pacman -S --noconfirm "$repo_pkg"; then
                 echo -e "${red}Failed to install $repo_pkg. Attempting to reinstall Flatpak $appid...${reset}"
+                ((failed_count++))
+                rollback_ok=false
                 if [[ -n "$origin" && "$origin" != "NA" ]]; then
-                    [[ "$install" == "user" ]] && run_command flatpak install -y --user "$origin" "$appid" \
-                        || run_command sudo flatpak install -y --system "$origin" "$appid"
+                    if [[ "$install" == "user" ]]; then
+                        run_command flatpak install -y --user "$origin" "$appid" && rollback_ok=true
+                    else
+                        run_command sudo flatpak install -y --system "$origin" "$appid" && rollback_ok=true
+                    fi
                 fi
+                if [[ "$rollback_ok" != true ]]; then
+                    echo -e "${red}ROLLBACK FAILED: Flatpak $appid could not be restored. Stopping the script.${reset}"
+                    return 1
+                fi
+                echo -e "${yellow}Rollback successful: Flatpak $appid was restored.${reset}"
                 continue
             fi
 
             echo -e "${green}Replaced Flatpak $appid with repo package $repo_pkg successfully.${reset}"
         done
-        echo -e "${green}All Flatpak replacements completed.${reset}"
+        if ((failed_count == 0)); then
+            echo -e "${green}All Flatpak replacements completed.${reset}"
+        else
+            echo -e "${yellow}Flatpak replacement pass completed with ${failed_count} app(s) left unchanged/restored.${reset}"
+        fi
     else
         echo -e "${red}Replacement operation skipped by user.${reset}"
     fi
+    return 0
 }
 
 # Orchestrate the full update flow across pacman, AUR, and Flatpak.
@@ -1322,7 +1445,10 @@ perform_updates() {
     fi
 
     # ---- Replace AUR with repo ----
-    replace_aur_with_repo
+    if ! replace_aur_with_repo; then
+        echo -e "${red}AUR-to-repo replacement rollback failed.${reset}"
+        return 1
+    fi
 
     # ---- Yay update (best effort) ----
     prompt_for_db_lock_resolution
@@ -1332,15 +1458,18 @@ perform_updates() {
         fi
         echo
         echo -e "${red}Yay update failed.${reset}"
-        echo "Choose action:"
-        echo "  [r] Retry yay"
-        echo "  [c] Continue without yay"
-        read -rp "> " ans
-        case "${ans,,}" in
-            r) continue ;;
-            c) break ;;
-            *) break ;;
-        esac
+        while true; do
+            echo "Choose action:"
+            echo "  [r] Retry yay"
+            echo "  [c] Continue without yay"
+            read -rp "> " ans
+            case "${ans,,}" in
+                r|c) break ;;
+                *) echo -e "${red}Invalid choice. Please answer r or c.${reset}" ;;
+            esac
+        done
+        [[ "${ans,,}" == "r" ]] && continue
+        break
     done
 
     return 0
@@ -1703,6 +1832,16 @@ if ! perform_updates; then
     echo -e "${red}Update stage failed. Exiting.${reset}"
     exit 1
 fi
+
+# Record only a successfully completed core update stage.
+success_tmp="${SUCCESS_STAMP}.tmp.$$"
+if printf '%s\n' "$(date +%s)" > "$success_tmp" && mv -f "$success_tmp" "$SUCCESS_STAMP"; then
+    :
+else
+    rm -f "$success_tmp" 2> /dev/null || true
+    echo -e "${yellow}WARNING: Could not write successful-update timestamp.${reset}"
+fi
+
 rebuild_aur_if_needed || echo -e "${yellow}Rebuild skipped/failed.${reset}"
 
 ((++current_step))
@@ -1714,7 +1853,10 @@ if ! run_command gext update -y; then
     echo
     echo -e "${red}User extensions updates failed, continuing...${reset}"
 fi
-replace_flatpaks_with_repo
+if ! replace_flatpaks_with_repo; then
+    echo -e "${red}Flatpak-to-repo replacement rollback failed. Exiting.${reset}"
+    exit 1
+fi
 if ! run_command sudo flatpak update -y; then
     echo
     echo -e "${red}Flatpak update (sudo) failed, continuing...${reset}"
@@ -1734,13 +1876,20 @@ if command -v topgrade >/dev/null; then
     sudo fwupdmgr refresh --force >/dev/null 2>&1
 
     # 2. Topgrade AUTO για όλα εκτός firmware
-    if ! topgrade \
-        --yes \
-        --disable firmware config_update \
-        --notify-end never \
-        | sed 's/^/[topgrade] /'; then
-        echo -e "${yellow}Topgrade reported errors, continuing...${reset}"
-    fi
+    set -o pipefail
+
+topgrade \
+    --yes \
+    --disable firmware config_update \
+    --notify-end never \
+    | sed 's/^/[topgrade] /'
+topgrade_status=$?
+
+set +o pipefail
+
+if ((topgrade_status != 0)); then
+    echo -e "${yellow}Topgrade reported errors, continuing...${reset}"
+fi
 
     echo
 
@@ -2015,6 +2164,127 @@ else
     fi
 fi
 
+echo
+
+# Restore custom Pamac tray icons after package/extension updates.
+patch_pamac_tray_icons() {
+    local ext="/usr/share/gnome-shell/extensions/pamac-updates@manjaro.org/extension.js"
+    local icon_dir="$HOME/.local/share/icons/Tela-circle-light/16/panel"
+    local update_icon="$icon_dir/pamac-tray-update.svg"
+    local no_update_icon="$icon_dir/pamac-tray-no-update.svg"
+
+    echo -e "\n${cyan}Checking Pamac tray icon patch...${reset}"
+    echo
+    if [[ ! -f "$ext" ]]; then
+        echo -e "${yellow}Pamac Updates extension not found, skipping.${reset}"
+        return 0
+    fi
+
+    if [[ ! -f "$update_icon" || ! -f "$no_update_icon" ]]; then
+        echo -e "${yellow}Custom Pamac icons not found, skipping.${reset}"
+        return 0
+    fi
+
+    # Already patched.
+    if grep -qF "$update_icon" "$ext" &&
+       grep -qF "$no_update_icon" "$ext"; then
+        echo -e "${cyan}Pamac tray icon patch already applied.${reset}"
+        return 0
+    fi
+
+    # Only patch the known/current Pamac structure.
+    if ! grep -qF 'this.updateIcon = new St.Icon({icon_name: "pamac-tray-no-update"' "$ext" ||
+       ! grep -qF 'this.updateIcon.set_icon_name("pamac-tray-update")' "$ext" ||
+       ! grep -qF 'this.updateIcon.set_icon_name("pamac-tray-no-update")' "$ext"; then
+        echo -e "${yellow}Pamac extension structure has changed; patch skipped.${reset}"
+        return 0
+    fi
+
+    local version
+    version="$(grep -oP '"version"\s*:\s*\K[0-9]+' \
+        /usr/share/gnome-shell/extensions/pamac-updates@manjaro.org/metadata.json 2>/dev/null)"
+
+    if [[ -z "$version" ]]; then
+        echo -e "${yellow}Could not determine Pamac extension version; patch skipped.${reset}"
+        return 0
+    fi
+
+    local backup="${ext}.pamac-original"
+
+    echo -e "${green}Applying Pamac tray icon patch (Pamac extension v${version})...${reset}"
+
+    # Remove all previous backups before creating the new one.
+    if ! run_command sudo rm -f \
+        "${ext}.pamac-original" \
+        "${ext}.pamac-v"*-original; then
+        echo -e "${red}Failed to remove previous Pamac backups; patch aborted.${reset}"
+        return 1
+    fi
+
+    # Backup the current unpatched extension.
+    if ! run_command sudo cp -a "$ext" "$backup"; then
+        echo -e "${red}Failed to backup Pamac extension; patch aborted.${reset}"
+        return 1
+    fi
+
+    if ! sudo python3 - "$ext" "$update_icon" "$no_update_icon" <<'PY'
+from pathlib import Path
+import sys
+
+ext = Path(sys.argv[1])
+update_icon = sys.argv[2]
+no_update_icon = sys.argv[3]
+
+s = ext.read_text()
+
+replacements = [
+    (
+        'this.updateIcon = new St.Icon({icon_name: "pamac-tray-no-update", style_class: \'system-status-icon\'});',
+        f'''this.updateIcon = new St.Icon({{
+            gicon: Gio.FileIcon.new(Gio.file_new_for_path("{no_update_icon}")),
+            style_class: 'system-status-icon'
+        }});'''
+    ),
+    (
+        'this.updateIcon.set_icon_name("pamac-tray-update");',
+        f'''this.updateIcon.set_gicon(
+                Gio.FileIcon.new(Gio.file_new_for_path("{update_icon}"))
+            );'''
+    ),
+    (
+        'this.updateIcon.set_icon_name("pamac-tray-no-update");',
+        f'''this.updateIcon.set_gicon(
+                Gio.FileIcon.new(Gio.file_new_for_path("{no_update_icon}"))
+            );'''
+    )
+]
+
+for old, new in replacements:
+    if s.count(old) != 1:
+        sys.exit(1)
+    s = s.replace(old, new, 1)
+
+ext.write_text(s)
+PY
+    then
+        echo -e "${red}Pamac tray icon patch failed; restoring backup...${reset}"
+        sudo cp -a "$backup" "$ext"
+        return 1
+    fi
+
+    if grep -qF "$update_icon" "$ext" &&
+       grep -qF "$no_update_icon" "$ext" &&
+       grep -qF "set_gicon" "$ext"; then
+        echo -e "${green}Pamac tray icon patch applied successfully.${reset}"
+    else
+        echo -e "${red}Pamac tray icon patch verification failed; restoring backup...${reset}"
+        sudo cp -a "$backup" "$ext"
+        return 1
+    fi
+}
+
+patch_pamac_tray_icons
+
 echo -e "\n\n\n"
 
 # Cleaning thumbnails, screenshots, downloads, and trash
@@ -2179,7 +2449,13 @@ echo -e "\n\n\n"
 # Pacnew Pacsave handling
 mapfile -t pac_files < <(
     sudo find / \
-        \( -path "/.snapshots" -prune \) -o \
+        \( \
+            -path "/proc" -o \
+            -path "/sys" -o \
+            -path "/dev" -o \
+            -path "/run" -o \
+            -path "/.snapshots" \
+        \) -prune -o \
         -regextype posix-extended -regex ".+\.pac(new|save)" -print 2> /dev/null
 )
 echo -e "${cyan}Checking for .pacnew and .pacsave files...${reset}"
@@ -2199,131 +2475,165 @@ else
         read -r
         echo
         rm -rf ~/meld-temp
-        mkdir -p ~/meld-temp
-        sudo chown "$USER":"$USER" ~/meld-temp
-        chmod 700 ~/meld-temp
-        declare -A siblings
-        for pac_file in "${pac_files[@]}"; do
-            dir=$(dirname "$pac_file")
-            base=$(basename "$pac_file")
-            base_name="${base%.pacnew}"
-            base_name="${base_name%.pacsave}"
-            for match in "$dir"/"$base_name"*; do
-                [[ "$match" == "$pac_file" ]] && continue
-                [[ "$match" == *.pacnew || "$match" == *.pacsave ]] && continue
-                if [[ -f "$match" ]]; then
+        if ! mkdir -p ~/meld-temp || ! chmod 700 ~/meld-temp; then
+            echo -e "${red}Failed to prepare ~/meld-temp. Skipping .pacnew/.pacsave handling.${reset}"
+        else
+            declare -A siblings
+            declare -A staged_pac
+            declare -A staged_sibling
+            declare -A delete_requested
+            staging_failed=false
+
+            # Find only the exact active sibling (foo for foo.pacnew/foo.pacsave) and back it up.
+            for pac_file in "${pac_files[@]}"; do
+                dir=$(dirname "$pac_file")
+                base=$(basename "$pac_file")
+                base_name="${base%.pacnew}"
+                base_name="${base_name%.pacsave}"
+                match="$dir/$base_name"
+
+                if [[ -f "$match" && "$match" != "$pac_file" ]]; then
                     siblings["$pac_file"]="$match"
-                    for old_backup in "$match".backup-*; do
-                        [[ -e "$old_backup" ]] && sudo rm -f "$old_backup"
-                    done
                     backup="${match}.backup-$(date +%Y%m%d-%H%M%S)"
                     echo -e "${cyan}Backing up sibling:${reset} $match -> $backup"
-                    sudo cp -a "$match" "$backup"
-                    break
+                    if ! sudo cp -a "$match" "$backup"; then
+                        echo -e "${red}Failed to back up $match. No files will be synchronized.${reset}"
+                        staging_failed=true
+                        break
+                    fi
+                    for old_backup in "$match".backup-*; do
+                        [[ ! -e "$old_backup" || "$old_backup" == "$backup" ]] && continue
+                        sudo rm -f "$old_backup"
+                    done
                 fi
             done
-        done
-        for pac_file in "${pac_files[@]}"; do
-            dest=~/meld-temp"${pac_file}"
-            mkdir -p "$(dirname "$dest")"
-            sudo cp -a "$pac_file" "$dest"
-            sudo chown "$USER":"$USER" "$dest"
-            sibling="${siblings[$pac_file]}"
-            if [[ -n "$sibling" ]]; then
-                sibling_dest=~/meld-temp"${sibling}"
-                mkdir -p "$(dirname "$sibling_dest")"
-                sudo cp -a "$sibling" "$sibling_dest"
-                sudo chown "$USER":"$USER" "$sibling_dest"
+
+            # Stage files for editing. A missing temp file is never treated as deletion by itself.
+            if [[ "$staging_failed" == false ]]; then
+                for pac_file in "${pac_files[@]}"; do
+                    dest=~/meld-temp"${pac_file}"
+                    if ! mkdir -p "$(dirname "$dest")" \
+                        || ! sudo cp -a "$pac_file" "$dest" \
+                        || ! sudo chown "$USER":"$USER" "$dest"; then
+                        echo -e "${red}Failed to stage $pac_file. No files will be synchronized.${reset}"
+                        staging_failed=true
+                        break
+                    fi
+                    staged_pac["$pac_file"]=1
+
+                    sibling="${siblings[$pac_file]}"
+                    if [[ -n "$sibling" ]]; then
+                        sibling_dest=~/meld-temp"${sibling}"
+                        if ! mkdir -p "$(dirname "$sibling_dest")" \
+                            || ! sudo cp -a "$sibling" "$sibling_dest" \
+                            || ! sudo chown "$USER":"$USER" "$sibling_dest"; then
+                            echo -e "${red}Failed to stage sibling $sibling. No files will be synchronized.${reset}"
+                            staging_failed=true
+                            break
+                        fi
+                        staged_sibling["$pac_file"]=1
+                    fi
+                done
             fi
-        done
-        declare -A processed
-        for pac_file in "${pac_files[@]}"; do
-            [[ ${processed["$pac_file"]} ]] && continue
-            temp_file=~/meld-temp"${pac_file}"
-            sibling="${siblings[$pac_file]}"
-            sibling_temp=~/meld-temp"${sibling}"
-            echo
-            echo -e "${cyan}Processing:${reset} $temp_file"
-            echo
-            if [[ -n "$sibling" && -f "$sibling_temp" ]]; then
-                echo -e "${cyan}Launching meld for:$reset\n$temp_file\n$sibling_temp"
-                meld "$sibling_temp" "$temp_file"
-                processed["$pac_file"]=1
-                processed["$sibling"]=1
+
+            if [[ "$staging_failed" == true ]]; then
+                echo -e "${yellow}Staging failed; original config/.pacnew/.pacsave files were left untouched.${reset}"
             else
-                echo -e "${cyan}Opening in gnome-text-editor:$reset $temp_file"
-                gnome-text-editor "$temp_file" &> /dev/null
-                processed["$pac_file"]=1
-            fi
-            if [[ "$pac_file" == *.pacnew || "$pac_file" == *.pacsave ]]; then
-                echo
-                echo -ne "${red}Delete $temp_file? (y)es or any other key: ${reset}"
-                read -r del
-                echo
-                if [[ "$del" =~ ^[Yy]$ ]]; then
-                    rm -v "$temp_file"
-                fi
-            fi
-            echo
-            echo -ne "${yellow}Press Enter to continue to next file...${reset}"
-            read -r
-            echo
-        done
-        echo -ne "${yellow}Finalize all changes to files? (y)es or any key to continue with the script: ${reset}"
-        read -r sync
-        echo
-        if [[ "${sync,,}" == "y" ]]; then
-            for pac_file in "${pac_files[@]}"; do
-                original_file="$pac_file"
-                temp_file=~/meld-temp"${pac_file}"
-                if [[ -f "$temp_file" ]]; then
-                    if ! cmp -s "$temp_file" "$original_file"; then
-                        echo -e "${cyan}Copying back: $temp_file → $original_file${reset}"
-                        sudo cp -a "$temp_file" "$original_file"
+                declare -A processed
+                for pac_file in "${pac_files[@]}"; do
+                    [[ ${processed["$pac_file"]} ]] && continue
+                    temp_file=~/meld-temp"${pac_file}"
+                    sibling="${siblings[$pac_file]}"
+                    sibling_temp=~/meld-temp"${sibling}"
+                    echo
+                    echo -e "${cyan}Processing:${reset} $temp_file"
+                    echo
+                    if [[ -n "$sibling" && -f "$sibling_temp" ]]; then
+                        echo -e "${cyan}Launching meld for:$reset\n$temp_file\n$sibling_temp"
+                        meld "$sibling_temp" "$temp_file"
+                        processed["$pac_file"]=1
+                        processed["$sibling"]=1
                     else
-                        echo -e "${cyan}Unchanged:${reset} $original_file"
+                        echo -e "${cyan}Opening in gnome-text-editor:$reset $temp_file"
+                        gnome-text-editor "$temp_file" &> /dev/null
+                        processed["$pac_file"]=1
+                    fi
+
+                    echo
+                    echo -ne "${red}Delete $temp_file? (y)es or any other key: ${reset}"
+                    read -r del
+                    echo
+                    if [[ "$del" =~ ^[Yy]$ ]]; then
+                        delete_requested["$pac_file"]=1
+                        rm -v -- "$temp_file"
+                    fi
+
+                    echo
+                    echo -ne "${yellow}Press Enter to continue to next file...${reset}"
+                    read -r
+                    echo
+                done
+
+                echo -ne "${yellow}Finalize all changes to files? (y)es or any key to continue with the script: ${reset}"
+                read -r sync
+                echo
+                if [[ "${sync,,}" == "y" ]]; then
+                    for pac_file in "${pac_files[@]}"; do
+                        [[ -n "${staged_pac[$pac_file]:-}" ]] || continue
+                        original_file="$pac_file"
+                        temp_file=~/meld-temp"${pac_file}"
+                        if [[ -f "$temp_file" ]]; then
+                            if ! cmp -s "$temp_file" "$original_file"; then
+                                echo -e "${cyan}Copying back: $temp_file → $original_file${reset}"
+                                sudo cp -a "$temp_file" "$original_file"
+                            else
+                                echo -e "${cyan}Unchanged:${reset} $original_file"
+                            fi
+                        elif [[ -n "${delete_requested[$pac_file]:-}" ]]; then
+                            echo -e "${red}Removing: $original_file${reset}"
+                            sudo rm -f "$original_file"
+                        else
+                            echo -e "${red}Safety: staged file missing without explicit delete; leaving $original_file untouched.${reset}"
+                        fi
+                    done
+
+                    total_count=0
+                    updated_count=0
+                    unchanged_count=0
+                    for pac_file in "${pac_files[@]}"; do
+                        sibling="${siblings[$pac_file]}"
+                        if [[ -n "$sibling" && -n "${staged_sibling[$pac_file]:-}" ]]; then
+                            ((total_count++))
+                            sibling_temp=~/meld-temp"${sibling}"
+                            if [[ -f "$sibling_temp" ]]; then
+                                if ! cmp -s "$sibling_temp" "$sibling"; then
+                                    echo
+                                    echo -e "${cyan}Copying back: $sibling_temp → $sibling${reset}"
+                                    sudo cp -a "$sibling_temp" "$sibling"
+                                    ((updated_count++))
+                                else
+                                    echo
+                                    echo -e "${yellow}Unchanged:${reset} $sibling"
+                                    ((unchanged_count++))
+                                fi
+                            else
+                                echo
+                                echo -e "${red}Safety: staged sibling missing; leaving $sibling untouched.${reset}"
+                            fi
+                        fi
+                    done
+                    if ((total_count > 0)); then
+                        echo
+                        echo -e "${cyan}Config files sync summary:${reset}  ${blue}Total: $total_count${reset}  ${green}Updated: $updated_count${reset}  ${yellow}Unchanged: $unchanged_count${reset}"
                     fi
                 else
-                    echo -e "${red}Removing: $original_file${reset}"
-                    sudo rm -f "$original_file"
+                    echo
+                    echo -e "\n${cyan}Continuing without syncing changes...${reset}"
                 fi
-            done
-            total_count=0
-            updated_count=0
-            unchanged_count=0
-            for pac_file in "${pac_files[@]}"; do
-                sibling="${siblings[$pac_file]}"
-                if [[ -n "$sibling" ]]; then
-                    ((total_count++))
-                    sibling_temp=~/meld-temp"${sibling}"
-                    if [[ -f "$sibling_temp" ]]; then
-                        if ! cmp -s "$sibling_temp" "$sibling"; then
-                            echo
-                            echo -e "${cyan}Copying back: $sibling_temp → $sibling${reset}"
-                            sudo cp -a "$sibling_temp" "$sibling"
-                            ((updated_count++))
-                        else
-                            echo
-                            echo -e "${yellow}Unchanged:${reset} $sibling"
-                            ((unchanged_count++))
-                        fi
-                    else
-                        echo
-                        echo -e "${red}Removing sibling: $sibling${reset}"
-                        sudo rm -f "$sibling"
-                    fi
-                fi
-            done
-            if ((total_count > 0)); then
-                echo
-                echo -e "${cyan}Config files sync summary:${reset}  ${blue}Total: $total_count${reset}  ${green}Updated: $updated_count${reset}  ${yellow}Unchanged: $unchanged_count${reset}"
             fi
-        else
-            echo
-            echo -e "\n${cyan}Continuing without syncing changes...${reset}"
+            rm -rf ~/meld-temp
+            echo -e "\n\n\n"
         fi
-        rm -rf ~/meld-temp
-        echo -e "\n\n\n"
     else
         echo
         echo -e "${cyan}Skipping .pacnew/.pacsave handling${reset}"
@@ -2356,8 +2666,18 @@ find_old_files() {
 }
 mapfile -t pac_files < <(
     sudo find / \
-        \( -path "/.snapshots" -prune \) -o \
-        -type f \( -name "*.pacnew" -o -name "*.pacsave" -o -name "*.backup-[0-9]*" \) -print 2> /dev/null \
+        \( \
+            -path "/proc" -o \
+            -path "/sys" -o \
+            -path "/dev" -o \
+            -path "/run" -o \
+            -path "/.snapshots" \
+        \) -prune -o \
+        -type f \( \
+            -name "*.pacnew" -o \
+            -name "*.pacsave" -o \
+            -name "*.backup-[0-9]*" \
+        \) -print 2> /dev/null \
         | find_old_files
 )
 if [ "${#pac_files[@]}" -eq 0 ]; then
@@ -2392,7 +2712,7 @@ echo -e "\n\n\n\n${purple}$(printf '%*s' 55 '' | tr ' ' '-') End $(printf '%*s' 
 echo -e "\n\n\n"
 
 # Stats after updates
-gnome_version_after="$(gnome-shell --version | awk '{print $3}')"
+gnome_version_after="$(pacman -Q gnome-shell | awk '{print $2}' | cut -d- -f1)"
 
 explicit_count2=$(pacman -Qe | wc -l)
 read total used avail <<< $(df / --block-size=1 | awk 'NR==2 {print $2, $3, $4}')
