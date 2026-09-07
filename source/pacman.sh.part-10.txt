@@ -1,0 +1,220 @@
+        return 0
+    fi
+    echo
+    echo -e "${yellow}Unused ${scope} Flatpak remotes:${reset}"
+    printf '%s\n' "${unused[@]}"
+    echo
+    echo -ne "${yellow}Remove these remotes? (y)es or any other key to skip: ${reset}"
+    read -r ans
+    echo
+    if [[ "${ans,,}" != "y" ]]; then
+        echo -e "${cyan}Skipping ${scope} remotes cleanup.${reset}"
+        return 0
+    fi
+    for r in "${unused[@]}"; do
+        echo -e "${cyan}Removing ${scope} remote: ${orange}${r}${reset}"
+        if ! "${remote_del_cmd[@]}" "$r"; then
+            echo -e "${red}Failed to remove remote: ${r}${reset}"
+        fi
+    done
+    echo -e "${green}${scope} remotes cleanup done.${reset}"
+}
+cleanup_flatpak_remotes user
+echo
+cleanup_flatpak_remotes system
+echo -e "\n\n\n"
+
+# Cleaning unwanted Manjaro Gnome extensions
+echo -e "${cyan}Checking for unwanted Manjaro Gnome extensions...${reset}"
+
+mapfile -t unwanted_exts < <(
+    find /usr/share/gnome-shell/extensions/ \
+        -mindepth 1 -maxdepth 1 -type d \
+        ! \( \
+        -name 'argos@pew.worldwidemann.com' -o \
+        -name 'pamac-updates@manjaro.org' -o \
+        -iname '*argos*' -o \
+        -iname '*pamac*' \
+        \)
+)
+
+if [[ ${#unwanted_exts[@]} -eq 0 ]]; then
+    echo
+    echo -e "${cyan}No unwanted system Gnome extensions found.${reset}"
+else
+    if sudo rm -rf "${unwanted_exts[@]}"; then
+        echo
+        echo -e "${green}Unwanted system Gnome extensions deleted.${reset}"
+    else
+        echo
+        echo -e "${red}Failed to delete unwanted system Gnome extensions, continuing...${reset}"
+    fi
+fi
+
+echo
+
+# Restore custom Pamac tray icons after package/extension updates.
+patch_pamac_tray_icons() {
+    local ext="/usr/share/gnome-shell/extensions/pamac-updates@manjaro.org/extension.js"
+    local icon_dir="$HOME/.local/share/icons/Tela-circle-light/16/panel"
+    local update_icon="$icon_dir/pamac-tray-update.svg"
+    local no_update_icon="$icon_dir/pamac-tray-no-update.svg"
+
+    echo -e "\n${cyan}Checking Pamac tray icon patch...${reset}"
+    echo
+    if [[ ! -f "$ext" ]]; then
+        echo -e "${yellow}Pamac Updates extension not found, skipping.${reset}"
+        return 0
+    fi
+
+    if [[ ! -f "$update_icon" || ! -f "$no_update_icon" ]]; then
+        echo -e "${yellow}Custom Pamac icons not found, skipping.${reset}"
+        return 0
+    fi
+
+    # Already patched.
+    if grep -qF "$update_icon" "$ext" &&
+       grep -qF "$no_update_icon" "$ext"; then
+        echo -e "${cyan}Pamac tray icon patch already applied.${reset}"
+        return 0
+    fi
+
+    # Only patch the known/current Pamac structure.
+    if ! grep -qF 'this.updateIcon = new St.Icon({icon_name: "pamac-tray-no-update"' "$ext" ||
+       ! grep -qF 'this.updateIcon.set_icon_name("pamac-tray-update")' "$ext" ||
+       ! grep -qF 'this.updateIcon.set_icon_name("pamac-tray-no-update")' "$ext"; then
+        echo -e "${yellow}Pamac extension structure has changed; patch skipped.${reset}"
+        return 0
+    fi
+
+    local version
+    version="$(grep -oP '"version"\s*:\s*\K[0-9]+' \
+        /usr/share/gnome-shell/extensions/pamac-updates@manjaro.org/metadata.json 2>/dev/null)"
+
+    if [[ -z "$version" ]]; then
+        echo -e "${yellow}Could not determine Pamac extension version; patch skipped.${reset}"
+        return 0
+    fi
+
+    local backup="${ext}.pamac-original"
+
+    echo -e "${green}Applying Pamac tray icon patch (Pamac extension v${version})...${reset}"
+
+    # Remove all previous backups before creating the new one.
+    if ! run_command sudo rm -f \
+        "${ext}.pamac-original" \
+        "${ext}.pamac-v"*-original; then
+        echo -e "${red}Failed to remove previous Pamac backups; patch aborted.${reset}"
+        return 1
+    fi
+
+    # Backup the current unpatched extension.
+    if ! run_command sudo cp -a "$ext" "$backup"; then
+        echo -e "${red}Failed to backup Pamac extension; patch aborted.${reset}"
+        return 1
+    fi
+
+    if ! sudo python3 - "$ext" "$update_icon" "$no_update_icon" <<'PY'
+from pathlib import Path
+import sys
+
+ext = Path(sys.argv[1])
+update_icon = sys.argv[2]
+no_update_icon = sys.argv[3]
+
+s = ext.read_text()
+
+replacements = [
+    (
+        'this.updateIcon = new St.Icon({icon_name: "pamac-tray-no-update", style_class: \'system-status-icon\'});',
+        f'''this.updateIcon = new St.Icon({{
+            gicon: Gio.FileIcon.new(Gio.file_new_for_path("{no_update_icon}")),
+            style_class: 'system-status-icon'
+        }});'''
+    ),
+    (
+        'this.updateIcon.set_icon_name("pamac-tray-update");',
+        f'''this.updateIcon.set_gicon(
+                Gio.FileIcon.new(Gio.file_new_for_path("{update_icon}"))
+            );'''
+    ),
+    (
+        'this.updateIcon.set_icon_name("pamac-tray-no-update");',
+        f'''this.updateIcon.set_gicon(
+                Gio.FileIcon.new(Gio.file_new_for_path("{no_update_icon}"))
+            );'''
+    )
+]
+
+for old, new in replacements:
+    if s.count(old) != 1:
+        sys.exit(1)
+    s = s.replace(old, new, 1)
+
+ext.write_text(s)
+PY
+    then
+        echo -e "${red}Pamac tray icon patch failed; restoring backup...${reset}"
+        sudo cp -a "$backup" "$ext"
+        return 1
+    fi
+
+    if grep -qF "$update_icon" "$ext" &&
+       grep -qF "$no_update_icon" "$ext" &&
+       grep -qF "set_gicon" "$ext"; then
+        echo -e "${green}Pamac tray icon patch applied successfully.${reset}"
+    else
+        echo -e "${red}Pamac tray icon patch verification failed; restoring backup...${reset}"
+        sudo cp -a "$backup" "$ext"
+        return 1
+    fi
+}
+
+patch_pamac_tray_icons
+
+echo -e "\n\n\n"
+
+# Cleaning thumbnails, screenshots, downloads, and trash
+echo -e "${cyan}Checking thumbnails, screenshots, downloads, and trash...${reset}"
+echo
+TARGETS=(
+    "$HOME/.cache/thumbnails"
+    "$HOME/Screenshots"
+    "$HOME/Downloads"
+)
+TRASH_SUBFOLDERS=(files info expunged)
+for SUB in "${TRASH_SUBFOLDERS[@]}"; do
+    TARGETS+=("$HOME/.local/share/Trash/$SUB")
+done
+for DIR in "${TARGETS[@]}"; do
+    if [ -d "$DIR" ]; then
+        if find "$DIR" -mindepth 1 -print -quit 2> /dev/null | read -r _; then
+            if find "$DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2> /dev/null; then
+                echo -e "${green}Cleaned: $DIR${reset}"
+            else
+                echo -e "${red}Failed to clean: $DIR${reset}"
+            fi
+        else
+            echo -e "${cyan}Nothing to clean in: $DIR${reset}"
+        fi
+    else
+        echo -e "${yellow}Directory not found: $DIR${reset}"
+    fi
+done
+echo -e "\n\n\n"
+echo -e "${cyan}Checking orphaned app configs...${reset}\n"
+
+# Clean Home folder leftovers
+normalize_key() { tr '[:upper:]' '[:lower:]' <<< "$1" | sed 's/[^a-z0-9]//g'; }
+EXCLUDE_FILE="$HOME/.orphaned_home_apps.exclude"
+touch "$EXCLUDE_FILE"
+chmod 600 "$EXCLUDE_FILE"
+declare -A EXCLUDED_PATHS=()
+while IFS= read -r line; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    EXCLUDED_PATHS["$line"]=1
+done < "$EXCLUDE_FILE"
+
+# Helper function: exclude_path
+exclude_path() {
+    local p="$1"
