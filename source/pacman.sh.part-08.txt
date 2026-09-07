@@ -1,0 +1,220 @@
+                if [[ -z "${YAY_FILES_DB_READY:-}" ]]; then
+                    yay -Fy > /dev/null 2>&1 || true
+                    YAY_FILES_DB_READY=1
+                fi
+
+                if [[ -n "${aur_candidates_cache[$lib]+x}" ]]; then
+                    mapfile -t aur_providers < <(printf '%s\n' "${aur_candidates_cache[$lib]}")
+                else
+                    mapfile -t aur_providers < <(
+                        yay -Fq -- "$lib" 2> /dev/null | sort -u
+                    )
+                    aur_candidates_cache["$lib"]="$(printf '%s\n' "${aur_providers[@]}")"
+                fi
+
+                if ((${#aur_providers[@]} == 1)); then
+                    aur_pkg="${aur_providers[0]}"
+                    [[ -n "${seen_aur[$aur_pkg]:-}" ]] || {
+                        aur_to_install+=("$aur_pkg")
+                        seen_aur["$aur_pkg"]=1
+                    }
+                elif ((${#aur_providers[@]} > 1)); then
+                    mapfile -t aur_providers < <(
+                        for provider in "${aur_providers[@]}"; do
+                            printf '%08d\t%s\n' "$((-${provider_cover_count["aur:$provider"]:-0}))" "$provider"
+                        done | sort -k1,1n -k2,2 | cut -f2-
+                    )
+
+                    cache_key="aur|$(printf '%s\n' "${aur_providers[@]}" | sort -u | tr '\n' '|')"
+
+                    if [[ -n "${provider_choice_cache[$cache_key]+x}" ]]; then
+                        aur_pkg="${provider_choice_cache[$cache_key]}"
+                        if [[ -n "$aur_pkg" ]]; then
+                            [[ -n "${seen_aur[$aur_pkg]:-}" ]] || {
+                                aur_to_install+=("$aur_pkg")
+                                seen_aur["$aur_pkg"]=1
+                            }
+                            continue
+                        else
+                            echo -e "${yellow}Reusing previous skip for AUR provider set of ${lib}${reset}"
+                            unresolved=true
+                            continue
+                        fi
+                    fi
+
+                    if aur_pkg="$(choose_provider "$lib" "${aur_providers[@]}")"; then
+                        provider_choice_cache["$cache_key"]="$aur_pkg"
+                        [[ -n "${seen_aur[$aur_pkg]:-}" ]] || {
+                            aur_to_install+=("$aur_pkg")
+                            seen_aur["$aur_pkg"]=1
+                        }
+                    else
+                        provider_choice_cache["$cache_key"]=""
+                        echo -e "${yellow}Skipped AUR provider selection for ${lib}${reset}"
+                        unresolved=true
+                    fi
+                else
+                    echo -e "${red}No provider found for ${lib}${reset}"
+                    unresolved=true
+                fi
+            done
+
+            if ((${#repo_to_install[@]} > 0)); then
+                echo -e "${cyan}Installing repo providers:${reset} ${repo_to_install[*]}"
+                prompt_for_db_lock_resolution
+                if ! sudo pacman -S --needed --noconfirm "${repo_to_install[@]}"; then
+                    echo -e "${red}Failed to install repo provider set.${reset}"
+                    unresolved=true
+                fi
+            fi
+
+            if ((${#aur_to_install[@]} > 0)); then
+                echo -e "${cyan}Installing AUR providers:${reset} ${aur_to_install[*]}"
+                if ! yay -S --needed --noconfirm "${aur_to_install[@]}"; then
+                    echo -e "${red}Failed to install AUR provider set.${reset}"
+                    unresolved=true
+                fi
+            fi
+
+            mapfile -t still_missing < <(
+                for bin in "${bins[@]}"; do
+                    ldd "$bin" 2> /dev/null | awk '/not found/ {print $1}'
+                done | sort -u
+            )
+
+            if [[ "$unresolved" == false ]] && ((${#still_missing[@]} == 0)); then
+                echo -e "${green}Runtime fixed → skipping rebuild${reset}"
+                continue
+            fi
+
+            if ((${#still_missing[@]} > 0)); then
+                echo -e "${red}Still missing after resolution:${reset} ${still_missing[*]}"
+            else
+                echo -e "${yellow}Provider resolution incomplete/ambiguous → keeping rebuild flag${reset}"
+            fi
+
+            aur_to_rebuild+=("$pkg")
+        else
+            echo -e "${blue}No missing libs now → keeping rebuild flag from rebuild-detector${reset}"
+            aur_to_rebuild+=("$pkg")
+        fi
+    done
+
+    if ((${#aur_to_rebuild[@]} == 0)); then
+        echo -e "\n${green}No rebuilds required after dependency resolution.${reset}"
+        return 0
+    fi
+
+    echo -e "\n${orange}Rebuilding:${reset} ${aur_to_rebuild[*]}"
+
+    if ! run_command yay -S --noconfirm --rebuild --rebuildtree --cleanafter --editmenu=false "${aur_to_rebuild[@]}"; then
+        echo -e "${red}Rebuild step failed.${reset}"
+        return 1
+    fi
+
+    echo -e "${green}Rebuild step completed.${reset}"
+    return 0
+}
+# ---- Call site: hard gate updates, then rebuild ----
+# Capture pre-update state silently. Keep the recovery manifest separate from the update log.
+mapfile -t FAILED_UNITS_BEFORE < <(
+    systemctl --failed --no-legend --plain --no-pager 2> /dev/null \
+        | awk 'NF {print $1}' | sort -u
+)
+
+RECOVERY_MANIFEST="$HOME/Recovery-Manifest.log"
+recovery_tmp="${RECOVERY_MANIFEST}.tmp.$$"
+if {
+    echo "===== PRE-UPDATE RECOVERY MANIFEST ====="
+    echo "Timestamp: $(date --iso-8601=seconds)"
+    echo "Running kernel: $(uname -r 2> /dev/null || true)"
+    echo
+    echo "--- Installed packages (pacman -Q) ---"
+    pacman -Q 2>&1 || true
+    echo
+    echo "--- Explicit packages (pacman -Qqe) ---"
+    pacman -Qqe 2>&1 || true
+    echo
+    echo "--- Foreign/AUR packages (pacman -Qqm) ---"
+    pacman -Qqm 2>&1 || true
+    echo
+    echo "--- Installed Manjaro kernels (mhwd-kernel -li) ---"
+    mhwd-kernel -li 2>&1 || true
+    echo
+    echo "--- Failed systemd units before update ---"
+    if ((${#FAILED_UNITS_BEFORE[@]} > 0)); then
+        printf '%s\n' "${FAILED_UNITS_BEFORE[@]}"
+    else
+        echo "none"
+    fi
+    echo "===== END PRE-UPDATE RECOVERY MANIFEST ====="
+} > "$recovery_tmp" && mv -f "$recovery_tmp" "$RECOVERY_MANIFEST"; then
+    :
+else
+    rm -f "$recovery_tmp" 2> /dev/null || true
+    echo -e "${yellow}Warning: could not write recovery manifest: ${RECOVERY_MANIFEST}${reset}"
+fi
+
+if ! perform_updates; then
+    echo -e "${red}Update stage failed. Exiting.${reset}"
+    exit 1
+fi
+
+# Record only a successfully completed core update stage.
+success_tmp="${SUCCESS_STAMP}.tmp.$$"
+if printf '%s\n' "$(date +%s)" > "$success_tmp" && mv -f "$success_tmp" "$SUCCESS_STAMP"; then
+    :
+else
+    rm -f "$success_tmp" 2> /dev/null || true
+    echo -e "${yellow}WARNING: Could not write successful-update timestamp.${reset}"
+fi
+
+rebuild_aur_if_needed || echo -e "${yellow}Rebuild skipped/failed.${reset}"
+
+((++current_step))
+show_progress $current_step $total_steps
+echo -e "\n\n\n\n${purple}$(printf '%*s' 43 '' | tr ' ' '-') Extensions-Flatpaks updates $(printf '%*s' 43 '' | tr ' ' '-')${reset}"
+
+# Extensions updates
+if ! run_command gext update -y; then
+    echo
+    echo -e "${red}User extensions updates failed, continuing...${reset}"
+fi
+if ! replace_flatpaks_with_repo; then
+    echo -e "${red}Flatpak-to-repo replacement rollback failed. Exiting.${reset}"
+    exit 1
+fi
+if ! run_command sudo flatpak update -y; then
+    echo
+    echo -e "${red}Flatpak update (sudo) failed, continuing...${reset}"
+fi
+if ! run_command flatpak update -y; then
+    echo
+    echo -e "${red}Flatpak update (user) failed, continuing...${reset}"
+fi
+
+
+echo -e "\n\n\n"
+
+echo -e "${cyan}Running: topgrade${reset}"
+
+if command -v topgrade >/dev/null; then
+    # 1. Force refresh firmware DB
+    sudo fwupdmgr refresh --force >/dev/null 2>&1
+
+    # 2. Topgrade AUTO για όλα εκτός firmware
+    set -o pipefail
+
+topgrade \
+    --yes \
+    --disable firmware config_update \
+    --notify-end never \
+    | sed 's/^/[topgrade] /'
+topgrade_status=$?
+
+set +o pipefail
+
+if ((topgrade_status != 0)); then
+    echo -e "${yellow}Topgrade reported errors, continuing...${reset}"
+fi
+
