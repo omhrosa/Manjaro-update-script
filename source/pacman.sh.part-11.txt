@@ -1,0 +1,220 @@
+    [[ -n "${EXCLUDED_PATHS[$p]:-}" ]] && return 0
+    printf '%s\n' "$p" >> "$EXCLUDE_FILE"
+    EXCLUDED_PATHS["$p"]=1
+}
+declare -A INSTALLED_SET=()
+while IFS= read -r pkg; do
+    k=$(normalize_key "$pkg")
+    [[ -n "$k" ]] && INSTALLED_SET["$k"]=1
+done < <(pacman -Qq 2> /dev/null || true)
+while IFS= read -r appid; do
+    [[ -z "$appid" ]] && continue
+    k_full=$(normalize_key "$appid")
+    k_last=$(normalize_key "${appid##*.}")
+    [[ -n "$k_full" ]] && INSTALLED_SET["$k_full"]=1
+    [[ -n "$k_last" ]] && INSTALLED_SET["$k_last"]=1
+done < <(flatpak list --app --columns=application 2> /dev/null || true)
+SCAN_DIRS=("$HOME/.config" "$HOME/.cache" "$HOME/.local/share" "$HOME/.local/state")
+KEEP_BASENAMES=("Trash" "dconf" "gtk-3.0" "gtk-4.0" "fontconfig" "pulse" "pipewire")
+
+# Helper function: is_kept_basename.
+is_kept_basename() {
+    local b="$1"
+    for k in "${KEEP_BASENAMES[@]}"; do [[ "$b" == "$k" ]] && return 0; done
+    return 1
+}
+: "${ORPHAN_FUZZY:=1}"
+
+# Helper function: matches_installed.
+matches_installed() {
+    local base="$1"
+    local key
+    key=$(normalize_key "$base")
+    [[ ${#key} -lt 3 ]] && return 0
+    [[ -n "${INSTALLED_SET[$key]:-}" ]] && return 0
+    if ((ORPHAN_FUZZY == 1)); then
+        local k
+        for k in "${!INSTALLED_SET[@]}"; do
+            [[ ${#k} -lt 4 ]] && continue
+            [[ "$key" == *"$k"* || "$k" == *"$key"* ]] && return 0
+        done
+    fi
+    return 1
+}
+CANDIDATES=()
+for dir in "${SCAN_DIRS[@]}"; do
+    [[ -d "$dir" ]] || continue
+    while IFS= read -r -d '' entry; do
+        base=${entry##*/}
+        is_kept_basename "$base" && continue
+        matches_installed "$base" && continue
+        entry_real=$(realpath -e -- "$entry" 2> /dev/null || printf '%s' "$entry")
+        [[ -n "${EXCLUDED_PATHS[$entry_real]:-}" ]] && continue
+        CANDIDATES+=("$entry_real")
+    done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d -print0 2> /dev/null)
+done
+mkdir -p /tmp/manjaro
+outfile=$(mktemp -p /tmp/manjaro orphaned_home_apps.XXXXXX.txt 2> /dev/null || echo "/tmp/manjaro/orphaned_home_apps.txt")
+printf "%s\n" "${CANDIDATES[@]}" > "$outfile"
+DELETED_ANY=false
+if ((${#CANDIDATES[@]} == 0)); then
+    echo -e "${cyan}No orphaned app configs detected.${reset}"
+else
+    echo -e "${orange}Probable orphaned app directories found (${#CANDIDATES[@]}).${reset}"
+    echo -e "${blue}Saved list:${reset} $outfile"
+    echo -e "${blue}Exclude list:${reset} $EXCLUDE_FILE\n"
+    for candidate in "${CANDIDATES[@]}"; do
+        [[ -d "$candidate" ]] || continue
+        cand_real=$(realpath -e -- "$candidate" 2> /dev/null || printf '%s' "$candidate")
+        case "$cand_real" in
+            "$HOME/.config/"* | "$HOME/.cache/"* | "$HOME/.local/share/"* | "$HOME/.local/state/"*) ;;
+            *)
+                echo -e "${red}Refusing to touch outside scan roots:${reset} $cand_real\n"
+                continue
+                ;;
+        esac
+        echo -e "$cand_real"
+        echo -ne "${yellow}(e)xclude forever  (d)elete permanently  (s)kip: ${reset}"
+        read -r action
+        echo
+        case "${action,,}" in
+            e | "")
+                exclude_path "$cand_real"
+                echo -e "${green}Excluded:${reset} $cand_real"
+                ;;
+            d)
+                if rm -rf -- "$cand_real"; then
+                    echo -e "${green}Deleted:${reset} $cand_real"
+                    DELETED_ANY=true
+                else
+                    echo -e "${red}Failed to delete:${reset} $cand_real"
+                fi
+                ;;
+            *)
+                echo -e "${cyan}Skipped:${reset} $cand_real"
+                ;;
+        esac
+        echo
+    done
+fi
+if $DELETED_ANY; then
+    echo -e "${green}Orphaned app configs cleaned.${reset}"
+fi
+
+# Clean yay package cache
+if ! run_command bash -c "yes | yay -Scc"; then
+    echo
+    echo -e "${red}Failed to clean package cache with yay -Scc, trying manual cache deletion...${reset}"
+    run_command rm -rf "$HOME/.cache/yay/"*
+fi
+
+((++current_step))
+show_progress $current_step $total_steps
+echo -e "\n\n\n\n${purple}$(printf '%*s' 44 '' | tr ' ' '-') .Pacsave .Pacnew handling $(printf '%*s' 44 '' | tr ' ' '-')${reset}"
+echo -e "\n\n\n"
+
+# Unified Pacnew/Pacsave/config-backup handling.
+# Scan once, stay on the root filesystem, and apply no age limit.
+mapfile -t pac_scan_files < <(
+    sudo find / -xdev \
+        \( \
+            -path "/proc" -o \
+            -path "/sys" -o \
+            -path "/dev" -o \
+            -path "/run" -o \
+            -path "/.snapshots" \
+        \) -prune -o \
+        -type f \( \
+            -name "*.pacnew" -o \
+            -name "*.pacsave" -o \
+            -name "*.backup-*" \
+        \) -print 2> /dev/null
+)
+
+pac_files=()
+backup_files=()
+for file in "${pac_scan_files[@]}"; do
+    case "$file" in
+        *.pacnew | *.pacsave) pac_files+=("$file") ;;
+        *.backup-*) backup_files+=("$file") ;;
+    esac
+done
+
+echo -e "${cyan}Checking .pacnew/.pacsave and config backup files...${reset}"
+
+if ((${#pac_files[@]} == 0)); then
+    echo -e "${cyan}No .pacnew or .pacsave found.${reset}"
+else
+    echo
+    echo -e "${red}Found ${#pac_files[@]} .pacnew/.pacsave file(s):${reset}"
+    printf '%s\n' "${pac_files[@]}"
+    echo
+    echo -ne "${yellow}Deal with .pacsave/.pacnew? (n)o or any other key: ${reset}"
+    read -r choice
+    if [[ ! "$choice" =~ ^[Nn]$ ]]; then
+        echo
+        echo -ne "${yellow}Press Enter to review...${reset}"
+        read -r
+        echo
+        rm -rf ~/meld-temp
+        if ! mkdir -p ~/meld-temp || ! chmod 700 ~/meld-temp; then
+            echo -e "${red}Failed to prepare ~/meld-temp. Skipping .pacnew/.pacsave handling.${reset}"
+        else
+            declare -A siblings
+            declare -A staged_pac
+            declare -A staged_sibling
+            declare -A delete_requested
+            staging_failed=false
+
+            # Find only the exact active sibling and create a fresh safety backup.
+            # Existing backups are handled later in this same unified stage.
+            for pac_file in "${pac_files[@]}"; do
+                dir=$(dirname "$pac_file")
+                base=$(basename "$pac_file")
+                base_name="${base%.pacnew}"
+                base_name="${base_name%.pacsave}"
+                match="$dir/$base_name"
+
+                if [[ -f "$match" && "$match" != "$pac_file" ]]; then
+                    siblings["$pac_file"]="$match"
+                    backup="${match}.backup-$(date +%Y%m%d-%H%M%S)"
+                    echo -e "${cyan}Backing up sibling:${reset} $match -> $backup"
+                    if ! sudo cp -a "$match" "$backup"; then
+                        echo -e "${red}Failed to back up $match. No files will be synchronized.${reset}"
+                        staging_failed=true
+                        break
+                    fi
+                fi
+            done
+
+            # Stage files for editing. A missing temp file is never treated as deletion by itself.
+            if [[ "$staging_failed" == false ]]; then
+                for pac_file in "${pac_files[@]}"; do
+                    dest=~/meld-temp"${pac_file}"
+                    if ! mkdir -p "$(dirname "$dest")" \
+                        || ! sudo cp -a "$pac_file" "$dest" \
+                        || ! sudo chown "$USER":"$USER" "$dest"; then
+                        echo -e "${red}Failed to stage $pac_file. No files will be synchronized.${reset}"
+                        staging_failed=true
+                        break
+                    fi
+                    staged_pac["$pac_file"]=1
+
+                    sibling="${siblings[$pac_file]}"
+                    if [[ -n "$sibling" ]]; then
+                        sibling_dest=~/meld-temp"${sibling}"
+                        if ! mkdir -p "$(dirname "$sibling_dest")" \
+                            || ! sudo cp -a "$sibling" "$sibling_dest" \
+                            || ! sudo chown "$USER":"$USER" "$sibling_dest"; then
+                            echo -e "${red}Failed to stage sibling $sibling. No files will be synchronized.${reset}"
+                            staging_failed=true
+                            break
+                        fi
+                        staged_sibling["$pac_file"]=1
+                    fi
+                done
+            fi
+
+            if [[ "$staging_failed" == true ]]; then
+                echo -e "${yellow}Staging failed; original config/.pacnew/.pacsave files were left untouched.${reset}"
+            else
