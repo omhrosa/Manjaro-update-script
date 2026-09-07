@@ -39,20 +39,10 @@ The script contains several defensive checks and rollback paths, but those do no
 
 ## Usage
 
-The script is intentionally interactive and expects the Manjaro/GNOME/Btrfs/Snapper environment and dependencies assumed by the code.
-
-The current source is stored verbatim as numbered text parts under [`source/`](./source/). Read them in numeric order. To reconstruct a single local file:
-
-```bash
-cat source/pacman.sh.part-*.txt > pacman.sh
-```
-
-The reconstructed file should have SHA-256:
-
-`fad1951e55e51abb405e2592912fbb4fd78b520300b12e76c7a21909b8103ffa`
+The script is intentionally interactive and expects the Manjaro/GNOME/Btrfs/Snapper environment and dependencies assumed by the code. Read `pacman.sh` first.
 
 ## License
 
 Apache License 2.0.
 
-[View the source parts](./source/)
+[View the full script](./pacman.sh)
