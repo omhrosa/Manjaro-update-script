@@ -1,0 +1,220 @@
+    done
+
+    if ((${#valid_replace[@]} == 0)); then
+        echo -e "${orange}No Flatpaks found with matching Manjaro repo packages (after exclusions).${cyan} Nothing to replace.${reset}"
+        return 0
+    fi
+
+    echo
+    echo -e "${yellow}The following Flatpaks appear to exist as Manjaro repo packages:${reset}"
+    printf "%-45s %-8s %-20s %-30s\n" "Flatpak AppID" "Scope" "Origin" "Repo Package"
+    printf "%-45s %-8s %-20s %-30s\n" "-----------" "-----" "------" "------------"
+
+    for entry in "${valid_replace[@]}"; do
+        appid="$(cut -d'|' -f1 <<< "$entry")"
+        origin="$(cut -d'|' -f2 <<< "$entry")"
+        install="$(cut -d'|' -f3 <<< "$entry")"
+        repo_pkg="$(cut -d'|' -f4- <<< "$entry")"
+        printf "%-45s %-8s %-20s %-30s\n" "$appid" "$install" "${origin:-NA}" "$repo_pkg"
+    done
+
+    echo
+    echo -ne "${cyan}Proceed with replacing them? (y)es or any other key to skip: ${reset}"
+    read -r choice < /dev/tty
+
+    if [[ "$choice" =~ ^[Yy]$ ]]; then
+        local failed_count=0
+        for entry in "${valid_replace[@]}"; do
+            appid="$(cut -d'|' -f1 <<< "$entry")"
+            origin="$(cut -d'|' -f2 <<< "$entry")"
+            install="$(cut -d'|' -f3 <<< "$entry")"
+            repo_pkg="$(cut -d'|' -f4- <<< "$entry")"
+
+            echo -e "${cyan}Removing Flatpak app: $appid...${reset}"
+            if [[ "$install" == "user" ]]; then
+                if ! run_command flatpak uninstall -y --user "$appid"; then
+                    ((failed_count++))
+                    continue
+                fi
+            else
+                if ! run_command sudo flatpak uninstall -y --system "$appid"; then
+                    ((failed_count++))
+                    continue
+                fi
+            fi
+
+            echo -e "${cyan}Installing repo package: $repo_pkg...${reset}"
+            prompt_for_db_lock_resolution
+            if ! run_command sudo pacman -S --noconfirm "$repo_pkg"; then
+                echo -e "${red}Failed to install $repo_pkg. Attempting to reinstall Flatpak $appid...${reset}"
+                ((failed_count++))
+                rollback_ok=false
+                if [[ -n "$origin" && "$origin" != "NA" ]]; then
+                    if [[ "$install" == "user" ]]; then
+                        run_command flatpak install -y --user "$origin" "$appid" && rollback_ok=true
+                    else
+                        run_command sudo flatpak install -y --system "$origin" "$appid" && rollback_ok=true
+                    fi
+                fi
+                if [[ "$rollback_ok" != true ]]; then
+                    echo -e "${red}ROLLBACK FAILED: Flatpak $appid could not be restored. Stopping the script.${reset}"
+                    return 1
+                fi
+                echo -e "${yellow}Rollback successful: Flatpak $appid was restored.${reset}"
+                continue
+            fi
+
+            echo -e "${green}Replaced Flatpak $appid with repo package $repo_pkg successfully.${reset}"
+        done
+        if ((failed_count == 0)); then
+            echo -e "${green}All Flatpak replacements completed.${reset}"
+        else
+            echo -e "${yellow}Flatpak replacement pass completed with ${failed_count} app(s) left unchanged/restored.${reset}"
+        fi
+    else
+        echo -e "${red}Replacement operation skipped by user.${reset}"
+    fi
+    return 0
+}
+
+# Orchestrate the full update flow across pacman, AUR, and Flatpak.
+perform_updates() {
+    echo
+    prompt_for_db_lock_resolution
+
+    # ---- Pacman repo update loop (hard gate) ----
+    while true; do
+        local pacman_tmp_log="/tmp/manjaro/pacman_attempt.log"
+        : > "$pacman_tmp_log"
+
+        local had_pipefail=0
+        set -o | grep -q 'pipefail[[:space:]]*on' && had_pipefail=1
+        set -o pipefail
+
+        local pacman_log="/var/log/pacman.log"
+        local log_start
+        log_start=$(wc -l < "$pacman_log" 2> /dev/null || echo 0)
+
+        echo -e "\n\n\n${cyan}Running: sudo pacman -Syyu --noconfirm >&3 2>&4${reset}"
+        sudo pacman -Syyu --noconfirm >&3 2>&4
+        local status=$?
+        if ((status == 0)); then
+            echo -e "${green}Command 'sudo pacman -Syyu --noconfirm >&3 2>&4' completed successfully.${reset}"
+        else
+            echo -e "${red}Command 'sudo pacman -Syyu --noconfirm >&3 2>&4' failed with exit code ${status}.${reset}"
+        fi
+
+        [[ -r "$pacman_log" ]] || : > "$pacman_tmp_log"
+        tail -n +"$((log_start + 1))" "$pacman_log" > "$pacman_tmp_log" 2> /dev/null
+        cat "$pacman_tmp_log" >> "$log_path"
+        if ((status == 0)); then
+            ((had_pipefail == 0)) && set +o pipefail
+            break
+        fi
+
+        ((had_pipefail == 0)) && set +o pipefail
+
+        # ---- Failure classification ----
+        if grep -qiE '(signature.*(could not be verified|invalid|unknown|revoked|failed)|invalid.*signature|failed to verify signature|keyring|gpgme|gpg:|public key|unknown trust|marginal trust|trust database|expired key|revoked key)' "$pacman_tmp_log"; then
+            echo
+            echo -e "${red}PGP / signature error detected.${reset}"
+            echo
+            echo "Choose recovery action:"
+            echo "  [r] Refresh keyring (non-destructive)"
+            echo "  [n] Nuke keyring and rebuild"
+            echo "  [e] Exit"
+            read -rp "> " ans
+            case "${ans,,}" in
+                r)
+                    echo -e "${cyan}Refreshing keyring...${reset}"
+                    sudo pacman -Syy --noconfirm archlinux-keyring manjaro-keyring || true
+                    sudo pacman-key --refresh-keys || true
+                    continue
+                    ;;
+                n)
+                    echo -e "${yellow}Nuking keyring and rebuilding...${reset}"
+                    sudo rm -rf /etc/pacman.d/gnupg
+                    sudo pacman-key --init
+                    sudo pacman-key --populate archlinux manjaro
+                    continue
+                    ;;
+                e)
+                    echo -e "${red}Aborting.${reset}"
+                    return 1
+                    ;;
+                *)
+                    echo -e "${red}Invalid choice. Aborting.${reset}"
+                    return 1
+                    ;;
+            esac
+        else
+            echo
+            echo -e "${red}Pacman failed (non-PGP error).${reset}"
+            echo "Choose action:"
+            echo "  [r] Retry"
+            echo "  [e] Exit"
+            read -rp "> " ans
+            case "${ans,,}" in
+                r) continue ;;
+                e) return 1 ;;
+                *)
+                    echo -e "${red}Invalid choice. Exiting.${reset}"
+                    return 1
+                    ;;
+            esac
+        fi
+    done
+
+    # ---- Repo package list (warning only) ----
+    mkdir -p /tmp/manjaro
+    if ! pacman -Slq | sort -u > /tmp/manjaro/repo_pkgs.txt; then
+        echo
+        echo -e "${yellow}WARNING: Failed to generate repo package list.${reset}"
+    fi
+
+    # ---- Replace AUR with repo ----
+    if ! replace_aur_with_repo; then
+        echo -e "${red}AUR-to-repo replacement rollback failed.${reset}"
+        return 1
+    fi
+
+    # ---- Yay update (best effort) ----
+    prompt_for_db_lock_resolution
+    while true; do
+        if run_command yay -Syu --devel --noconfirm --cleanafter --editmenu=false --combinedupgrade; then
+            break
+        fi
+        echo
+        echo -e "${red}Yay update failed.${reset}"
+        while true; do
+            echo "Choose action:"
+            echo "  [r] Retry yay"
+            echo "  [c] Continue without yay"
+            read -rp "> " ans
+            case "${ans,,}" in
+                r|c) break ;;
+                *) echo -e "${red}Invalid choice. Please answer r or c.${reset}" ;;
+            esac
+        done
+        [[ "${ans,,}" == "r" ]] && continue
+        break
+    done
+
+    return 0
+}
+
+# Helper function: rebuild_aur_if_needed.
+choose_provider() {
+    local lib="$1"
+    shift
+    local -a providers=("$@")
+
+    ((${#providers[@]} > 0)) || return 1
+
+    echo > /dev/tty
+    echo -e "${yellow}Multiple providers found for:${reset} ${orange}${lib}${reset}" > /dev/tty
+
+    local i=1
+    local provider
+    for provider in "${providers[@]}"; do
+        echo " [$i] $provider" > /dev/tty
