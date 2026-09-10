@@ -1560,6 +1560,11 @@ choose_provider() {
     return 0
 }
 
+# Rebuild handling state for this script run. A package is rebuilt at most once;
+# prebuilt -bin packages are reported but never "repaired" by installing arbitrary
+# packages that happen to contain an old SONAME.
+declare -A REBUILD_ATTEMPTED=()
+
 rebuild_aur_if_needed() {
     echo -e "\n\n\n${cyan}Checking for packages that need rebuild (rebuild-detector)...${reset}"
 
@@ -1593,281 +1598,59 @@ rebuild_aur_if_needed() {
 
     echo -e "${orange}Candidates:${reset} ${candidates[*]}"
 
-    local -a aur_to_rebuild=()
-
-    local -A provider_choice_cache=()
-    local -A repo_candidates_cache=()
-    local -A aur_candidates_cache=()
-
+    local -a to_rebuild=()
+    local -a prebuilt_skipped=()
+    local -a already_attempted=()
     local pkg
+
     for pkg in "${candidates[@]}"; do
         echo -e "\n${cyan}Analyzing:${reset} ${pkg}"
 
-        local -a scan_paths=()
-        local -a bins=()
-        local -a missing_libs=()
-        local -a still_missing=()
-
-        mapfile -t scan_paths < <(
-            pacman -Qlq "$pkg" 2> /dev/null \
-                | awk '
-        /^\/usr\/bin\// { print; next }
-        /^\/opt\// { print; next }
-        /^\/usr\/lib\/[^/]+\.so(\.[0-9]+)*$/ { print; next }
-        /^\/usr\/lib\/.*\/(plugins?|modules?)\/.*\.so(\.[0-9]+)*$/ { print; next }
-      ' \
-                | sort -u
-        )
-
-        local path
-        for path in "${scan_paths[@]}"; do
-            [[ -f "$path" ]] || continue
-            if [[ "$(LC_ALL=C head -c 4 -- "$path" 2> /dev/null)" == $'\x7fELF' ]]; then
-                bins+=("$path")
-            fi
-        done
-
-        if ((${#bins[@]} == 0)); then
-            echo -e "${yellow}No ELF binaries found under /usr/bin, /opt, or selected /usr/lib paths → fallback to rebuild${reset}"
-            aur_to_rebuild+=("$pkg")
+        # A -bin package contains upstream/prebuilt ELF objects. Re-running its
+        # PKGBUILD only repackages the same binaries; it cannot relink them against
+        # current system libraries. Also, never install an unrelated package merely
+        # because pacman/yay -F says it owns the missing SONAME.
+        if [[ "$pkg" == *-bin ]]; then
+            prebuilt_skipped+=("$pkg")
+            echo -e "${yellow}Prebuilt -bin package flagged by rebuild-detector.${reset}"
+            echo -e "${blue}Automatic rebuild/provider installation skipped; wait for an upstream/AUR package update.${reset}"
             continue
         fi
 
-        mapfile -t missing_libs < <(
-            for bin in "${bins[@]}"; do
-                ldd "$bin" 2> /dev/null | awk '/not found/ {print $1}'
-            done | sort -u
-        )
-
-        if ((${#missing_libs[@]} > 0)); then
-            echo -e "${yellow}Missing libs:${reset} ${missing_libs[*]}"
-
-            if [[ -z "${PACMAN_FILES_DB_READY:-}" ]]; then
-                sudo pacman -Fy > /dev/null 2>&1 || true
-                PACMAN_FILES_DB_READY=1
-            fi
-
-            local unresolved=false
-            local lib
-
-            local -a repo_to_install=()
-            local -a aur_to_install=()
-            local -A seen_repo=()
-            local -A seen_aur=()
-            local -A provider_cover_count=()
-
-            for lib in "${missing_libs[@]}"; do
-                local -a pre_repo=()
-                local -a pre_aur=()
-
-                if [[ -n "${repo_candidates_cache[$lib]+x}" ]]; then
-                    mapfile -t pre_repo < <(printf '%s\n' "${repo_candidates_cache[$lib]}")
-                else
-                    mapfile -t pre_repo < <(
-                        pacman -Fq -- "$lib" 2> /dev/null | sort -u
-                    )
-                    repo_candidates_cache["$lib"]="$(printf '%s\n' "${pre_repo[@]}")"
-                fi
-
-                if ((${#pre_repo[@]} == 0)); then
-                    if [[ -z "${YAY_FILES_DB_READY:-}" ]]; then
-                        yay -Fy > /dev/null 2>&1 || true
-                        YAY_FILES_DB_READY=1
-                    fi
-
-                    if [[ -n "${aur_candidates_cache[$lib]+x}" ]]; then
-                        mapfile -t pre_aur < <(printf '%s\n' "${aur_candidates_cache[$lib]}")
-                    else
-                        mapfile -t pre_aur < <(
-                            yay -Fq -- "$lib" 2> /dev/null | sort -u
-                        )
-                        aur_candidates_cache["$lib"]="$(printf '%s\n' "${pre_aur[@]}")"
-                    fi
-                fi
-
-                local provider
-                for provider in "${pre_repo[@]}"; do
-                    ((provider_cover_count["repo:$provider"]++))
-                done
-                for provider in "${pre_aur[@]}"; do
-                    ((provider_cover_count["aur:$provider"]++))
-                done
-            done
-
-            for lib in "${missing_libs[@]}"; do
-                echo -e "Resolving: ${lib}"
-
-                local -a repo_providers=()
-                local -a aur_providers=()
-                local repo_pkg=""
-                local aur_pkg=""
-                local cache_key=""
-
-                if [[ -n "${repo_candidates_cache[$lib]+x}" ]]; then
-                    mapfile -t repo_providers < <(printf '%s\n' "${repo_candidates_cache[$lib]}")
-                else
-                    mapfile -t repo_providers < <(
-                        pacman -Fq -- "$lib" 2> /dev/null | sort -u
-                    )
-                    repo_candidates_cache["$lib"]="$(printf '%s\n' "${repo_providers[@]}")"
-                fi
-
-                if ((${#repo_providers[@]} == 1)); then
-                    repo_pkg="${repo_providers[0]}"
-                    [[ -n "${seen_repo[$repo_pkg]:-}" ]] || {
-                        repo_to_install+=("$repo_pkg")
-                        seen_repo["$repo_pkg"]=1
-                    }
-                    continue
-                elif ((${#repo_providers[@]} > 1)); then
-                    mapfile -t repo_providers < <(
-                        for provider in "${repo_providers[@]}"; do
-                            printf '%08d\t%s\n' "$((-${provider_cover_count["repo:$provider"]:-0}))" "$provider"
-                        done | sort -k1,1n -k2,2 | cut -f2-
-                    )
-
-                    cache_key="repo|$(printf '%s\n' "${repo_providers[@]}" | sort -u | tr '\n' '|')"
-
-                    if [[ -n "${provider_choice_cache[$cache_key]+x}" ]]; then
-                        repo_pkg="${provider_choice_cache[$cache_key]}"
-                        if [[ -n "$repo_pkg" ]]; then
-                            [[ -n "${seen_repo[$repo_pkg]:-}" ]] || {
-                                repo_to_install+=("$repo_pkg")
-                                seen_repo["$repo_pkg"]=1
-                            }
-                            continue
-                        else
-                            echo -e "${yellow}Reusing previous skip for repo provider set of ${lib}${reset}"
-                            unresolved=true
-                            continue
-                        fi
-                    fi
-
-                    if repo_pkg="$(choose_provider "$lib" "${repo_providers[@]}")"; then
-                        provider_choice_cache["$cache_key"]="$repo_pkg"
-                        [[ -n "${seen_repo[$repo_pkg]:-}" ]] || {
-                            repo_to_install+=("$repo_pkg")
-                            seen_repo["$repo_pkg"]=1
-                        }
-                        continue
-                    else
-                        provider_choice_cache["$cache_key"]=""
-                        echo -e "${yellow}Skipped repo provider selection for ${lib}${reset}"
-                        unresolved=true
-                        continue
-                    fi
-                fi
-
-                if [[ -z "${YAY_FILES_DB_READY:-}" ]]; then
-                    yay -Fy > /dev/null 2>&1 || true
-                    YAY_FILES_DB_READY=1
-                fi
-
-                if [[ -n "${aur_candidates_cache[$lib]+x}" ]]; then
-                    mapfile -t aur_providers < <(printf '%s\n' "${aur_candidates_cache[$lib]}")
-                else
-                    mapfile -t aur_providers < <(
-                        yay -Fq -- "$lib" 2> /dev/null | sort -u
-                    )
-                    aur_candidates_cache["$lib"]="$(printf '%s\n' "${aur_providers[@]}")"
-                fi
-
-                if ((${#aur_providers[@]} == 1)); then
-                    aur_pkg="${aur_providers[0]}"
-                    [[ -n "${seen_aur[$aur_pkg]:-}" ]] || {
-                        aur_to_install+=("$aur_pkg")
-                        seen_aur["$aur_pkg"]=1
-                    }
-                elif ((${#aur_providers[@]} > 1)); then
-                    mapfile -t aur_providers < <(
-                        for provider in "${aur_providers[@]}"; do
-                            printf '%08d\t%s\n' "$((-${provider_cover_count["aur:$provider"]:-0}))" "$provider"
-                        done | sort -k1,1n -k2,2 | cut -f2-
-                    )
-
-                    cache_key="aur|$(printf '%s\n' "${aur_providers[@]}" | sort -u | tr '\n' '|')"
-
-                    if [[ -n "${provider_choice_cache[$cache_key]+x}" ]]; then
-                        aur_pkg="${provider_choice_cache[$cache_key]}"
-                        if [[ -n "$aur_pkg" ]]; then
-                            [[ -n "${seen_aur[$aur_pkg]:-}" ]] || {
-                                aur_to_install+=("$aur_pkg")
-                                seen_aur["$aur_pkg"]=1
-                            }
-                            continue
-                        else
-                            echo -e "${yellow}Reusing previous skip for AUR provider set of ${lib}${reset}"
-                            unresolved=true
-                            continue
-                        fi
-                    fi
-
-                    if aur_pkg="$(choose_provider "$lib" "${aur_providers[@]}")"; then
-                        provider_choice_cache["$cache_key"]="$aur_pkg"
-                        [[ -n "${seen_aur[$aur_pkg]:-}" ]] || {
-                            aur_to_install+=("$aur_pkg")
-                            seen_aur["$aur_pkg"]=1
-                        }
-                    else
-                        provider_choice_cache["$cache_key"]=""
-                        echo -e "${yellow}Skipped AUR provider selection for ${lib}${reset}"
-                        unresolved=true
-                    fi
-                else
-                    echo -e "${red}No provider found for ${lib}${reset}"
-                    unresolved=true
-                fi
-            done
-
-            if ((${#repo_to_install[@]} > 0)); then
-                echo -e "${cyan}Installing repo providers:${reset} ${repo_to_install[*]}"
-                prompt_for_db_lock_resolution
-                if ! sudo pacman -S --needed --noconfirm "${repo_to_install[@]}"; then
-                    echo -e "${red}Failed to install repo provider set.${reset}"
-                    unresolved=true
-                fi
-            fi
-
-            if ((${#aur_to_install[@]} > 0)); then
-                echo -e "${cyan}Installing AUR providers:${reset} ${aur_to_install[*]}"
-                if ! yay -S --needed --noconfirm "${aur_to_install[@]}"; then
-                    echo -e "${red}Failed to install AUR provider set.${reset}"
-                    unresolved=true
-                fi
-            fi
-
-            mapfile -t still_missing < <(
-                for bin in "${bins[@]}"; do
-                    ldd "$bin" 2> /dev/null | awk '/not found/ {print $1}'
-                done | sort -u
-            )
-
-            if [[ "$unresolved" == false ]] && ((${#still_missing[@]} == 0)); then
-                echo -e "${green}Runtime fixed → skipping rebuild${reset}"
-                continue
-            fi
-
-            if ((${#still_missing[@]} > 0)); then
-                echo -e "${red}Still missing after resolution:${reset} ${still_missing[*]}"
-            else
-                echo -e "${yellow}Provider resolution incomplete/ambiguous → keeping rebuild flag${reset}"
-            fi
-
-            aur_to_rebuild+=("$pkg")
-        else
-            echo -e "${blue}No missing libs now → keeping rebuild flag from rebuild-detector${reset}"
-            aur_to_rebuild+=("$pkg")
+        # rebuild_aur_if_needed is intentionally called again after Topgrade.
+        # Never rebuild the same package twice in one script run if checkrebuild
+        # continues to flag it after the first attempt.
+        if [[ -n "${REBUILD_ATTEMPTED[$pkg]:-}" ]]; then
+            already_attempted+=("$pkg")
+            echo -e "${yellow}Already rebuilt once during this run; still flagged, not rebuilding again.${reset}"
+            continue
         fi
+
+        to_rebuild+=("$pkg")
     done
 
-    if ((${#aur_to_rebuild[@]} == 0)); then
-        echo -e "\n${green}No rebuilds required after dependency resolution.${reset}"
+    if ((${#prebuilt_skipped[@]} > 0)); then
+        echo -e "\n${yellow}Prebuilt rebuild-detector warnings:${reset} ${prebuilt_skipped[*]}"
+    fi
+
+    if ((${#already_attempted[@]} > 0)); then
+        echo -e "${yellow}Persistent flags after one rebuild attempt:${reset} ${already_attempted[*]}"
+    fi
+
+    if ((${#to_rebuild[@]} == 0)); then
+        echo -e "${green}No actionable AUR rebuilds in this pass.${reset}"
         return 0
     fi
 
-    echo -e "\n${orange}Rebuilding:${reset} ${aur_to_rebuild[*]}"
+    echo -e "\n${orange}Rebuilding:${reset} ${to_rebuild[*]}"
 
-    if ! run_command yay -S --noconfirm --rebuild --rebuildtree --cleanafter --editmenu=false "${aur_to_rebuild[@]}"; then
+    # Mark before invoking yay so the post-Topgrade pass cannot immediately
+    # repeat a failed or ineffective rebuild. A new script run gets a fresh state.
+    for pkg in "${to_rebuild[@]}"; do
+        REBUILD_ATTEMPTED["$pkg"]=1
+    done
+
+    if ! run_command yay -S --noconfirm --rebuild --rebuildtree --cleanafter --editmenu=false "${to_rebuild[@]}"; then
         echo -e "${red}Rebuild step failed.${reset}"
         return 1
     fi
@@ -2951,14 +2734,42 @@ fi
 mapfile -t rebuild_pending < <(
     checkrebuild 2> /dev/null | awk '$1=="foreign"{print $2}' | sort -u
 )
+
+# Distinguish rebuilds that can still be acted on from persistent diagnostics.
+# -bin packages cannot be relinked locally, and a package already rebuilt once in
+# this run must not trigger a second identical rebuild.
+rebuild_actionable=()
+rebuild_prebuilt=()
+rebuild_attempted_pending=()
+for p in "${rebuild_pending[@]}"; do
+    if [[ "$p" == *-bin ]]; then
+        rebuild_prebuilt+=("$p")
+    elif [[ -n "${REBUILD_ATTEMPTED[$p]:-}" ]]; then
+        rebuild_attempted_pending+=("$p")
+    else
+        rebuild_actionable+=("$p")
+    fi
+done
+
 if ((${#rebuild_pending[@]} == 0)); then
     echo -e "AUR rebuilds: ${green}OK${reset}"
-else
-    echo -e "AUR rebuilds: ${yellow}${#rebuild_pending[@]} pending${reset}"
+elif ((${#rebuild_actionable[@]} == 0)); then
+    warning_count=$((${#rebuild_prebuilt[@]} + ${#rebuild_attempted_pending[@]}))
+    echo -e "AUR rebuilds: ${green}0 actionable${reset}  ${yellow}${warning_count} diagnostic warning(s)${reset}"
     {
         echo
-        echo "Post-update rebuild candidates:"
-        printf '%s\n' "${rebuild_pending[@]}"
+        echo "Post-update rebuild-detector diagnostics:"
+        ((${#rebuild_prebuilt[@]} > 0)) && printf 'prebuilt -bin (not locally relinkable): %s\n' "${rebuild_prebuilt[*]}"
+        ((${#rebuild_attempted_pending[@]} > 0)) && printf 'still flagged after one rebuild this run: %s\n' "${rebuild_attempted_pending[*]}"
+    } >> "$log_path"
+else
+    echo -e "AUR rebuilds: ${yellow}${#rebuild_actionable[@]} actionable pending${reset}"
+    {
+        echo
+        echo "Post-update actionable rebuild candidates:"
+        printf '%s\n' "${rebuild_actionable[@]}"
+        ((${#rebuild_prebuilt[@]} > 0)) && printf 'prebuilt -bin warnings: %s\n' "${rebuild_prebuilt[*]}"
+        ((${#rebuild_attempted_pending[@]} > 0)) && printf 'still flagged after one rebuild this run: %s\n' "${rebuild_attempted_pending[*]}"
     } >> "$log_path"
 fi
 
