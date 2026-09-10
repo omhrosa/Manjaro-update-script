@@ -15,7 +15,7 @@ The script includes, among other things:
 - repository-update dry runs with package count and download-size reporting,
 - pacman updates with database-lock handling and PGP/keyring recovery options,
 - a pre-update recovery manifest and last-success timestamp,
-- AUR updates, missing-library/provider checks, and selective rebuild handling,
+- AUR updates and conservative rebuild-detector handling for source-built and prebuilt packages,
 - optional replacement of AUR/Flatpak packages with official repository packages, with rollback on failed replacements,
 - GNOME extension and Flatpak updates,
 - optional Topgrade and firmware handling,
